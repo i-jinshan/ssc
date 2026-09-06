@@ -10,6 +10,7 @@ import {
   LogOut,
   Wallet,
   Zap,
+  X,
 } from 'lucide-react';
 import { LoginScreen } from '@/LoginScreen';
 import { AutoBetPanel } from '@/AutoBetPanel';
@@ -1027,6 +1028,7 @@ function App() {
   const [draws, setDraws] = useState<DrawResult[]>(() => readStoredDraws(readStoredGame()));
   const [loadingDraws, setLoadingDraws] = useState(false);
   const [drawsError, setDrawsError] = useState('');
+  const [betError, setBetError] = useState('');
   const [tab, setTab] = useState<TabKey>('table');
   const [search, setSearch] = useState('');
   const [windowSize, setWindowSize] = useState(readStoredWindow);
@@ -1127,11 +1129,12 @@ function App() {
       const data = await resp.json();
       if (data.success) {
         setLastBetIssue(issue);
+        setBetError('');
       } else if (data.error) {
-        setDrawsError(data.error);
+        setBetError(data.error);
       }
     } catch {
-      setDrawsError('投注请求失败，请检查网络连接');
+      setBetError('投注请求失败，请检查网络连接');
     } finally {
       setPlacingBet(false);
     }
@@ -1412,6 +1415,22 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+        {/* Bet error banner */}
+        {betError && (
+          <div className="mb-6 flex items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-600">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="h-5 w-5 flex-shrink-0" />
+              <span>{betError}</span>
+            </div>
+            <button
+              onClick={() => setBetError('')}
+              className="flex-shrink-0 text-rose-400 transition hover:text-rose-600"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
         {/* Loading state */}
         {loadingDraws && draws.length === 0 && (
           <div className="flex flex-col items-center justify-center py-24">
