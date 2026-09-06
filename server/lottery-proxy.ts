@@ -1,5 +1,6 @@
 /** Local lottery proxy. Sessions live in memory for this Node process; no Supabase. */
 
+import { Buffer } from "node:buffer";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import type { Dispatcher } from "undici";
 
@@ -363,16 +364,20 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       }
 
       const imgBuffer = await captchaImgResp.arrayBuffer();
-  const imgBytes = new Uint8Array(imgBuffer);
-  let imgBase64: string;
-  // btoa with spread fails on large arrays; use chunked encoding
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < imgBytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...imgBytes.subarray(i, i + chunkSize));
-  }
-  imgBase64 = btoa(binary);
+      const imgBytes = new Uint8Array(imgBuffer);
+      let imgBase64: string;
+      if (typeof Buffer !== "undefined") {
+        imgBase64 = Buffer.from(imgBuffer).toString("base64");
+      } else {
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < imgBytes.length; i += chunk) {
+          binary += String.fromCharCode(...imgBytes.subarray(i, i + chunk));
+        }
+        imgBase64 = btoa(binary);
+      }
       const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
+      console.error(`[captcha] imgBytes=${imgBytes.length} base64Len=${imgBase64.length} type=${contentType}`);
 
       const sessionId = crypto.randomUUID();
       sessions.set(sessionId, {

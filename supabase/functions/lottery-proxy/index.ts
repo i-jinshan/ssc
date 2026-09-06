@@ -308,15 +308,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const imgBuffer = await captchaImgResp.arrayBuffer();
-  const imgBytes = new Uint8Array(imgBuffer);
-  let imgBase64: string;
-  // btoa with spread fails on large arrays; use chunked encoding
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < imgBytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...imgBytes.subarray(i, i + chunkSize));
-  }
-  imgBase64 = btoa(binary);
+      const imgBase64 = btoa(String.fromCharCode(...new Uint8Array(imgBuffer)));
       const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
 
       // Store session in Supabase

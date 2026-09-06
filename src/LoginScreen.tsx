@@ -16,12 +16,14 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [loading, setLoading] = useState(false);
   const [loadingCaptcha, setLoadingCaptcha] = useState(false);
   const [error, setError] = useState('');
+  const [imgError, setImgError] = useState(false);
   const captchaImgRef = useRef<HTMLImageElement>(null);
 
   const fetchCaptcha = useCallback(async () => {
     setLoadingCaptcha(true);
     setError('');
     setCaptchaInput('');
+    setImgError(false);
     try {
       const resp = await fetch(`${API_URL}?action=captcha`, {
         headers: {
@@ -36,6 +38,7 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
       if (!resp.ok || data.error || !data.captchaImage || !data.sessionId) {
         throw new Error(data.error || `获取验证码失败 (${resp.status})`);
       }
+      console.log('[captcha] received', data.captchaImage.slice(0, 60), 'len=', data.captchaImage.length);
       setCaptchaImage(data.captchaImage);
       setSessionId(data.sessionId);
     } catch (err) {
@@ -187,12 +190,17 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
                     <div className="flex h-full items-center justify-center">
                       <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
                     </div>
-                  ) : captchaImage ? (
+                  ) : captchaImage && !imgError ? (
                     <img
                       ref={captchaImgRef}
                       src={captchaImage}
                       alt="验证码"
                       className="h-full w-full object-cover"
+                      onError={() => {
+                        setImgError(true);
+                        setError('验证码图片加载失败，正在重试…');
+                        setTimeout(() => fetchCaptcha(), 1500);
+                      }}
                     />
                   ) : (
                     <div className="flex h-full items-center justify-center text-slate-500">
