@@ -147,7 +147,7 @@ npx pm2 restart ssc
 ## 注意事项
 
 1. **不能当纯静态网站**  
-   接口路径是 `/functions/v1/lottery-proxy`，必须由 `vite preview` / `npm start` 提供。只部署 `dist` 到 Nginx 会登录失败。
+   接口路径是 `/api/lottery`，必须由 `vite preview` / `npm start` 提供。只部署 `dist` 到 Nginx 会登录失败。
 
 2. **`LOTTERY_PROXY` 本机和服务器往往相反**  
    本机常要填 QuickQ；能直连的服务器应留空。配错会导致「获取验证码失败」。

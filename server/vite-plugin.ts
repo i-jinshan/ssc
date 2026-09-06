@@ -1,8 +1,17 @@
+import { Buffer } from 'node:buffer';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Connect, Plugin, PreviewServer, ViteDevServer } from 'vite';
-import { handleLotteryProxy } from './lottery-proxy';
 
-const PREFIX = '/functions/v1/lottery-proxy';
+const PREFIX = '/api/lottery';
+
+let handlerPromise: Promise<typeof import('./lottery-proxy')> | null = null;
+
+function loadHandler() {
+  if (!handlerPromise) {
+    handlerPromise = import('./lottery-proxy');
+  }
+  return handlerPromise;
+}
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
@@ -32,6 +41,7 @@ async function handleNodeRequest(req: IncomingMessage, res: ServerResponse): Pro
     headers,
     body: rawBody ? new Uint8Array(rawBody) : undefined,
   });
+  const { handleLotteryProxy } = await loadHandler();
   const response = await handleLotteryProxy(request);
 
   res.statusCode = response.status;
@@ -50,6 +60,7 @@ function attach(server: ViteDevServer | PreviewServer) {
       return;
     }
     void handleNodeRequest(req, res).catch((err: unknown) => {
+      console.error('[lottery-proxy] middleware error:', err);
       if (res.headersSent) return;
       res.statusCode = 500;
       res.setHeader('Content-Type', 'application/json');
