@@ -301,8 +301,10 @@ function nextIssue(issue: string): string | null {
   const compact = issue.match(/^(\d{8})(\d{1,4})$/);
   const match = hyphenated ?? compact;
   if (!match) return null;
-  const sequence = Number.parseInt(match[2], 10) + 1;
-  return `${match[1]}-${sequence}`;
+  const seqStr = match[2];
+  const width = seqStr.length;
+  const sequence = Number.parseInt(seqStr, 10) + 1;
+  return `${match[1]}-${String(sequence).padStart(width, '0')}`;
 }
 
 export const ballColor = (n: number): string => {
