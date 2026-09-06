@@ -296,6 +296,12 @@ function sum(nums: number[]): number {
   return nums.reduce((a, b) => a + b, 0);
 }
 
+function nextIssue(issue: string): string | null {
+  const match = issue.match(/^(\d{8})-(\d{1,4})$/);
+  if (!match) return null;
+  const sequence = Number.parseInt(match[2], 10) + 1;
+  return `${match[1]}-${sequence}`;
+}
 
 export const ballColor = (n: number): string => {
   const colors = [
@@ -1162,11 +1168,11 @@ function App() {
 
   useEffect(() => {
     if (!autoBetOn || !sessionId || draws.length === 0 || !recommendation.hasEnough) return;
-    const latestIssue = draws[0]?.issue;
-    if (!latestIssue || latestIssue === lastBetIssue) return;
+    const targetIssue = nextIssue(draws[0]?.issue ?? '');
+    if (!targetIssue || targetIssue === lastBetIssue) return;
     const picks = recommendation.nextPicks;
     if (picks.length === 0) return;
-    placeBet(latestIssue, picks);
+    placeBet(targetIssue, picks);
   }, [autoBetOn, sessionId, draws, recommendation, lastBetIssue, placeBet]);
 
   const applyWindowSize = useCallback((raw: string) => {
@@ -1598,10 +1604,10 @@ function App() {
                     setBetAmount(amount);
                   }}
                   nextPicks={overview.nextPicks}
-                  nextIssue={draws[0]?.issue ?? null}
+                  nextIssue={nextIssue(draws[0]?.issue ?? '')}
                   draws={draws}
                   onPlaceBet={() => {
-                    const issue = draws[0]?.issue;
+                    const issue = nextIssue(draws[0]?.issue ?? '');
                     if (issue && overview.nextPicks.length > 0) {
                       placeBet(issue, overview.nextPicks);
                     }

@@ -679,7 +679,32 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      const cookies = (session as SessionRow).cookies;
+      let cookies = (session as SessionRow).cookies;
+
+      const betPage = await fetchWithCookies(
+        LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
+        cookies,
+        { redirect: "follow" }
+      );
+      cookies = betPage.cookies;
+      const betFormToken =
+        getFormField(betPage.text, "__RequestVerificationToken") ??
+        (session as SessionRow).form_token ??
+        "";
+      const betPageIsLogin = /ErrorHandle\/Timeout|top\.location\.href|<form[^>]+action=["']\/Account\/LoginVerify/i.test(
+        betPage.text
+      );
+      if (betPageIsLogin) {
+        return new Response(
+          JSON.stringify({ error: "登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      await supabase
+        .from(SESSION_TABLE)
+        .update({ cookies })
+        .eq("id", sessionId);
 
       // Normalize issue: convert "20260906-123" to "20260906123" for SerialNumber
       const serialNumber = issue.replace("-", "");
@@ -708,6 +733,7 @@ Deno.serve(async (req: Request) => {
         BetMode: 0,
         Guid: guid,
         IsLoginByWeChat: false,
+        __RequestVerificationToken: betFormToken,
       };
 
       const betResp = await fetchWithCookies(
@@ -719,6 +745,7 @@ Deno.serve(async (req: Request) => {
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             "X-Requested-With": "XMLHttpRequest",
+            "RequestVerificationToken": betFormToken,
             Referer: LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
           },
         }
