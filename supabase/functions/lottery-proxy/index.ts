@@ -491,8 +491,10 @@ Deno.serve(async (req: Request) => {
 
       const cookies = (session as SessionRow).cookies;
 
+      const requestedLotteryId = Number((body as { lotteryId?: number }).lotteryId);
+      const lotteryId = [60, 127, 128].includes(requestedLotteryId) ? requestedLotteryId : 128;
       const trendUrl =
-        LOTTERY_BASE + `/DrawHistory/Trend/128?issue=${issueLimit}&day=0`;
+        LOTTERY_BASE + `/DrawHistory/Trend/${lotteryId}?issue=${issueLimit}&day=0`;
 
       // Follow redirects manually to collect all cookies across the chain
       let trendResp = await fetchWithCookies(trendUrl, cookies, {
@@ -688,7 +690,7 @@ Deno.serve(async (req: Request) => {
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: 1,
+        LotteryGameID: lotteryId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
@@ -726,8 +728,19 @@ Deno.serve(async (req: Request) => {
       // Many failure modes (insufficient balance, bet closed, etc.) return HTTP 200
       // with an error body or a non-JSON redirect, so we must verify carefully.
       if (betResp.status !== 200) {
+        const targetMessage = betResp.text
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]*>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 300);
         return new Response(
-          JSON.stringify({ error: `目标网站返回异常状态 ${betResp.status}` }),
+          JSON.stringify({
+            error: targetMessage
+              ? `目标网站拒绝投注（${betResp.status}）：${targetMessage}`
+              : `目标网站拒绝投注（状态 ${betResp.status}）`,
+          }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
