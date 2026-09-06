@@ -765,12 +765,23 @@ Deno.serve(async (req: Request) => {
           .replace(/<[^>]*>/g, " ")
           .replace(/\s+/g, " ")
           .trim()
-          .slice(0, 300);
+          .slice(0, 500);
         return new Response(
           JSON.stringify({
             error: targetMessage
               ? `目标网站拒绝投注（${betResp.status}）：${targetMessage}`
               : `目标网站拒绝投注（状态 ${betResp.status}）`,
+            debug: {
+              status: betResp.status,
+              rawResponse: betResp.text.slice(0, 1000),
+              sentBetData: betData,
+              formTokenFound: Boolean(betFormToken),
+              pageLotteryGameId,
+              targetLotteryGameId,
+              serialNumber,
+              betPageLength: betPage.text.length,
+              betPageSnippet: betPage.text.slice(0, 2000),
+            },
           }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );

@@ -1143,6 +1143,9 @@ function App() {
       } else if (data.error) {
         setBetError(data.error);
       }
+      if (data.debug) {
+        console.log('bet debug', data.debug);
+      }
     } catch {
       setBetError('投注请求失败，请检查网络连接');
     } finally {
