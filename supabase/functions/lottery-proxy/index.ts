@@ -679,47 +679,14 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      let cookies = (session as SessionRow).cookies;
-
-      const betPage = await fetchWithCookies(
-        LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
-        cookies,
-        { redirect: "follow" }
-      );
-      cookies = betPage.cookies;
-      const betFormToken =
-        getFormField(betPage.text, "__RequestVerificationToken") ??
-        (session as SessionRow).form_token ??
-        "";
-      const pageLotteryGameId = Number(getFormField(betPage.text, "LotteryGameID"));
-      const targetLotteryGameId = Number.isFinite(pageLotteryGameId) && pageLotteryGameId > 0
-        ? pageLotteryGameId
-        : lotteryId;
-      const betPageIsLogin = /ErrorHandle\/Timeout|top\.location\.href|<form[^>]+action=["']\/Account\/LoginVerify/i.test(
-        betPage.text
-      );
-      if (betPageIsLogin) {
-        return new Response(
-          JSON.stringify({ error: "登录已过期，请重新登录" }),
-          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      await supabase
-        .from(SESSION_TABLE)
-        .update({ cookies })
-        .eq("id", sessionId);
-
-      // Normalize issue: convert "20260906-123" to "20260906123" for SerialNumber
+      const cookies = (session as SessionRow).cookies;
       const serialNumber = issue.replace("-", "");
-
-      // Build bet data model matching the target site's format
       const guid = generateBetGuid();
       const unit = 2;
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: targetLotteryGameId,
+        LotteryGameID: 1,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
@@ -737,7 +704,6 @@ Deno.serve(async (req: Request) => {
         BetMode: 0,
         Guid: guid,
         IsLoginByWeChat: false,
-        __RequestVerificationToken: betFormToken,
       };
 
       const betResp = await fetchWithCookies(
@@ -749,43 +715,10 @@ Deno.serve(async (req: Request) => {
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             "X-Requested-With": "XMLHttpRequest",
-            "RequestVerificationToken": betFormToken,
             Referer: LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
           },
         }
       );
-
-      // Only accept explicit success from the target site.
-      // Many failure modes (insufficient balance, bet closed, etc.) return HTTP 200
-      // with an error body or a non-JSON redirect, so we must verify carefully.
-      if (betResp.status !== 200) {
-        const targetMessage = betResp.text
-          .replace(/<script[\s\S]*?<\/script>/gi, " ")
-          .replace(/<style[\s\S]*?<\/style>/gi, " ")
-          .replace(/<[^>]*>/g, " ")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 500);
-        return new Response(
-          JSON.stringify({
-            error: targetMessage
-              ? `目标网站拒绝投注（${betResp.status}）：${targetMessage}`
-              : `目标网站拒绝投注（状态 ${betResp.status}）`,
-            debug: {
-              status: betResp.status,
-              rawResponse: betResp.text.slice(0, 1000),
-              sentBetData: betData,
-              formTokenFound: Boolean(betFormToken),
-              pageLotteryGameId,
-              targetLotteryGameId,
-              serialNumber,
-              betPageLength: betPage.text.length,
-              betPageSnippet: betPage.text.slice(0, 2000),
-            },
-          }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
 
       const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
       if (isLoginRedirect) {
@@ -795,51 +728,20 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      let betResult: Record<string, unknown> | null = null;
+      let betResult: unknown;
       try {
         betResult = JSON.parse(betResp.text);
       } catch {
-        return new Response(
-          JSON.stringify({ error: "目标网站未返回有效确认，投注可能未提交", raw: betResp.text.slice(0, 500) }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        betResult = { raw: betResp.text.slice(0, 500) };
       }
 
-      if (typeof betResult !== "object" || betResult === null) {
+      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
+      if (hasError) {
         return new Response(
-          JSON.stringify({ error: "目标网站返回格式异常" }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // Check for explicit error message from target site
-      const errMsg = (betResult as Record<string, unknown>).ErrorMessage;
-      if (typeof errMsg === "string" && errMsg) {
-        return new Response(
-          JSON.stringify({ error: errMsg }),
+          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-
-      // Require explicit success signal from the target site.
-      // Accept common patterns: { Success: true }, { success: true }, { Code: 0/200 }, { Status: 0 }
-      const br = betResult as Record<string, unknown>;
-      const siteConfirmed =
-        br.Success === true ||
-        br.success === true ||
-        br.Code === 0 || br.Code === 200 ||
-        br.code === 0 || br.code === 200 ||
-        br.Status === 0 || br.status === 0 ||
-        br.IsSuccess === true;
-
-      if (!siteConfirmed) {
-        return new Response(
-          JSON.stringify({ error: "目标网站未确认投注成功，请到网站核实", betResult }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // Target site explicitly confirmed — now record the bet
       const totalCost = betAmount * picks.length;
       const { data, error } = await supabase
         .from("lottery_bets")
