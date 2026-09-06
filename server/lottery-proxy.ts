@@ -34,7 +34,24 @@ interface SessionRow {
   authenticated: boolean;
 }
 
+interface BetRow {
+  id: string;
+  session_id: string;
+  lottery_id: number;
+  issue: string;
+  picks: number[];
+  bet_amount: number;
+  total_cost: number;
+  status: string;
+  result_number: number | null;
+  payout: number;
+  net: number;
+  created_at: string;
+  settled_at: string | null;
+}
+
 const sessions = new Map<string, SessionRow>();
+const bets = new Map<string, BetRow[]>();
 
 let cachedProxyUrl: string | undefined;
 let cachedDispatcher: Dispatcher | undefined;
@@ -635,6 +652,149 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           draws: rawDraws.length > 0 ? rawDraws : (embeddedDraws.length > 0 ? embeddedDraws : tableDraws),
           html: trendResp.text.slice(0, 8000),
         }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "bet") {
+      const body = await req.json();
+      const { sessionId, lotteryId, issue, picks, betAmount } = body as {
+        sessionId: string;
+        lotteryId: number;
+        issue: string;
+        picks: number[];
+        betAmount: number;
+      };
+
+      if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
+        return new Response(
+          JSON.stringify({ error: "参数不完整" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const existing = bets.get(sessionId)?.find((b) => b.issue === issue);
+      if (existing) {
+        return new Response(
+          JSON.stringify({ error: "该期已存在投注记录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const betId = crypto.randomUUID();
+      const totalCost = betAmount * picks.length;
+      const bet: BetRow = {
+        id: betId,
+        session_id: sessionId,
+        lottery_id: lotteryId,
+        issue,
+        picks,
+        bet_amount: betAmount,
+        total_cost: totalCost,
+        status: "pending",
+        result_number: null,
+        payout: 0,
+        net: 0,
+        created_at: new Date().toISOString(),
+        settled_at: null,
+      };
+
+      if (!bets.has(sessionId)) bets.set(sessionId, []);
+      bets.get(sessionId)!.push(bet);
+
+      return new Response(
+        JSON.stringify({ success: true, betId }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betlist") {
+      const body = await req.json();
+      const { sessionId, lotteryId, status } = body as {
+        sessionId: string;
+        lotteryId?: number;
+        status?: string;
+      };
+
+      let list = bets.get(sessionId) ?? [];
+      if (lotteryId) list = list.filter((b) => b.lottery_id === lotteryId);
+      if (status) list = list.filter((b) => b.status === status);
+      list = [...list].sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? "")).slice(0, 200);
+
+      return new Response(
+        JSON.stringify({ bets: list }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betsettle") {
+      const body = await req.json();
+      const { sessionId, draws } = body as {
+        sessionId: string;
+        draws: { issue: string; numbers: number[] }[];
+      };
+
+      if (!sessionId || !Array.isArray(draws)) {
+        return new Response(
+          JSON.stringify({ error: "参数不完整" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const ODDS = 9.77;
+      let settledCount = 0;
+      const sessionBets = bets.get(sessionId) ?? [];
+
+      for (const draw of draws) {
+        const resultNumber = draw.numbers[4];
+        const issueKey = draw.issue.includes("-")
+          ? draw.issue
+          : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);
+
+        for (const bet of sessionBets) {
+          if (bet.status !== "pending") continue;
+          if (bet.issue !== draw.issue && bet.issue !== issueKey) continue;
+
+          const hit = bet.picks.includes(resultNumber);
+          const payout = hit ? bet.bet_amount * ODDS : 0;
+          const net = payout - bet.total_cost;
+          bet.status = hit ? "won" : "lost";
+          bet.result_number = resultNumber;
+          bet.payout = payout;
+          bet.net = net;
+          bet.settled_at = new Date().toISOString();
+          settledCount++;
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, settledCount }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betdelete") {
+      const body = await req.json();
+      const { betId } = body as { betId: string };
+
+      if (!betId) {
+        return new Response(
+          JSON.stringify({ error: "缺少投注ID" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      for (const [sid, list] of bets.entries()) {
+        const idx = list.findIndex((b) => b.id === betId);
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          bets.set(sid, list);
+          break;
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ success: true }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }

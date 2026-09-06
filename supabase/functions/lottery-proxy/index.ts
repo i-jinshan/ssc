@@ -586,6 +586,170 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (action === "bet") {
+      const body = await req.json();
+      const { sessionId, lotteryId, issue, picks, betAmount } = body as {
+        sessionId: string;
+        lotteryId: number;
+        issue: string;
+        picks: number[];
+        betAmount: number;
+      };
+
+      if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
+        return new Response(
+          JSON.stringify({ error: "参数不完整" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { data: existing } = await supabase
+        .from("lottery_bets")
+        .select("id")
+        .eq("session_id", sessionId)
+        .eq("issue", issue)
+        .maybeSingle();
+
+      if (existing) {
+        return new Response(
+          JSON.stringify({ error: "该期已存在投注记录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const totalCost = betAmount * picks.length;
+      const { data, error } = await supabase
+        .from("lottery_bets")
+        .insert({
+          session_id: sessionId,
+          lottery_id: lotteryId,
+          issue,
+          picks,
+          bet_amount: betAmount,
+          total_cost: totalCost,
+          status: "pending",
+        })
+        .select("id")
+        .single();
+
+      if (error) {
+        return new Response(
+          JSON.stringify({ error: "投注失败: " + error.message }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, betId: data.id }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betlist") {
+      const body = await req.json();
+      const { sessionId, lotteryId, status } = body as {
+        sessionId: string;
+        lotteryId?: number;
+        status?: string;
+      };
+
+      let query = supabase.from("lottery_bets").select("*").eq("session_id", sessionId);
+      if (lotteryId) query = query.eq("lottery_id", lotteryId);
+      if (status) query = query.eq("status", status);
+      query = query.order("created_at", { ascending: false }).limit(200);
+
+      const { data, error } = await query;
+
+      if (error) {
+        return new Response(
+          JSON.stringify({ error: "获取投注记录失败: " + error.message }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ bets: data ?? [] }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betsettle") {
+      const body = await req.json();
+      const { sessionId, draws } = body as {
+        sessionId: string;
+        draws: { issue: string; numbers: number[] }[];
+      };
+
+      if (!sessionId || !Array.isArray(draws)) {
+        return new Response(
+          JSON.stringify({ error: "参数不完整" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const ODDS = 9.77;
+      let settledCount = 0;
+
+      for (const draw of draws) {
+        const resultNumber = draw.numbers[4];
+        const issueKey = draw.issue.includes("-")
+          ? draw.issue
+          : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);
+
+        const { data: pendingBets } = await supabase
+          .from("lottery_bets")
+          .select("*")
+          .eq("session_id", sessionId)
+          .eq("status", "pending")
+          .or(`issue.eq.${draw.issue},issue.eq.${issueKey}`);
+
+        if (!pendingBets || pendingBets.length === 0) continue;
+
+        for (const bet of pendingBets) {
+          const hit = bet.picks.includes(resultNumber);
+          const payout = hit ? Number(bet.bet_amount) * ODDS : 0;
+          const net = payout - Number(bet.total_cost);
+
+          await supabase
+            .from("lottery_bets")
+            .update({
+              status: hit ? "won" : "lost",
+              result_number: resultNumber,
+              payout,
+              net,
+              settled_at: new Date().toISOString(),
+            })
+            .eq("id", bet.id);
+
+          settledCount++;
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, settledCount }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betdelete") {
+      const body = await req.json();
+      const { betId } = body as { betId: string };
+
+      if (!betId) {
+        return new Response(
+          JSON.stringify({ error: "缺少投注ID" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      await supabase.from("lottery_bets").delete().eq("id", betId);
+
+      return new Response(
+        JSON.stringify({ success: true }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     return new Response(
       JSON.stringify({ error: "Unknown action: " + action }),
       {

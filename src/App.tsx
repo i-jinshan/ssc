@@ -9,12 +9,14 @@ import {
   AlertCircle,
   LogOut,
   Wallet,
+  Zap,
 } from 'lucide-react';
 import { LoginScreen } from '@/LoginScreen';
+import { AutoBetPanel } from '@/AutoBetPanel';
 import { API_URL, API_HEADERS } from '@/api';
 import type { DrawResult } from '@/lotteryData';
 
-type TabKey = 'table' | 'frequency' | 'trend' | 'profit';
+type TabKey = 'table' | 'frequency' | 'trend' | 'profit' | 'autobet';
 
 const WINDOW_MIN = 1;
 const WINDOW_MAX = 100;
@@ -37,6 +39,9 @@ const DEFAULT_MARTINGALE_FACTOR = 2;
 const MARTINGALE_RESET_MIN = 1;
 const MARTINGALE_RESET_MAX = 20;
 const DEFAULT_MARTINGALE_RESET = 3;
+const AUTO_BET_ON_KEY = 'lottery-auto-bet-on';
+const BET_AMOUNT_KEY = 'lottery-bet-amount';
+const DEFAULT_BET_AMOUNT = 100;
 
 type GameId = 60 | 127 | 128;
 
@@ -202,6 +207,42 @@ function persistMartingaleReset(value: number) {
   }
 }
 
+function readStoredAutoBetOn(): boolean {
+  try {
+    return localStorage.getItem(AUTO_BET_ON_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function persistAutoBetOn(value: boolean) {
+  try {
+    localStorage.setItem(AUTO_BET_ON_KEY, value ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+function readStoredBetAmount(): number {
+  try {
+    const raw = localStorage.getItem(BET_AMOUNT_KEY);
+    if (!raw) return DEFAULT_BET_AMOUNT;
+    const parsed = Number.parseFloat(raw);
+    if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_BET_AMOUNT;
+    return parsed;
+  } catch {
+    return DEFAULT_BET_AMOUNT;
+  }
+}
+
+function persistBetAmount(value: number) {
+  try {
+    localStorage.setItem(BET_AMOUNT_KEY, String(value));
+  } catch {
+    // ignore
+  }
+}
+
 function mergeDraws(prev: DrawResult[], incoming: DrawResult[]): DrawResult[] {
   const map = new Map<string, DrawResult>();
   for (const draw of prev) map.set(draw.issue, draw);
@@ -255,7 +296,7 @@ function sum(nums: number[]): number {
 }
 
 
-const ballColor = (n: number): string => {
+export const ballColor = (n: number): string => {
   const colors = [
     'from-rose-500 to-rose-600',
     'from-orange-500 to-orange-600',
@@ -292,7 +333,7 @@ function StatCard({
   );
 }
 
-function NumberBall({ n, size = 'md' }: { n: number; size?: 'sm' | 'md' | 'lg' }) {
+export function NumberBall({ n, size = 'md' }: { n: number; size?: 'sm' | 'md' | 'lg' }) {
   const sizes = {
     sm: 'h-7 w-7 text-xs',
     md: 'h-10 w-10 text-base',
@@ -1002,6 +1043,10 @@ function App() {
   const [martingaleResetDraft, setMartingaleResetDraft] = useState(() =>
     String(readStoredMartingaleReset())
   );
+  const [autoBetOn, setAutoBetOn] = useState(readStoredAutoBetOn);
+  const [betAmount, setBetAmount] = useState(readStoredBetAmount);
+  const [placingBet, setPlacingBet] = useState(false);
+  const [lastBetIssue, setLastBetIssue] = useState<string | null>(null);
   const gameIdRef = useRef(gameId);
   gameIdRef.current = gameId;
 
@@ -1061,7 +1106,47 @@ function App() {
     setSessionId(null);
     setDraws([]);
     setDrawsError('');
+    setLastBetIssue(null);
   }, []);
+
+  const placeBet = useCallback(async (issue: string, picks: number[]) => {
+    if (!sessionId || !issue || picks.length === 0) return;
+    setPlacingBet(true);
+    try {
+      const resp = await fetch(`${API_URL}?action=bet`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({
+          sessionId,
+          lotteryId: gameId,
+          issue,
+          picks,
+          betAmount,
+        }),
+      });
+      const data = await resp.json();
+      if (data.success) {
+        setLastBetIssue(issue);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setPlacingBet(false);
+    }
+  }, [sessionId, gameId, betAmount]);
+
+  const settleBets = useCallback(async () => {
+    if (!sessionId || draws.length === 0) return;
+    try {
+      await fetch(`${API_URL}?action=betsettle`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId, draws: draws.slice(0, 30) }),
+      });
+    } catch {
+      // ignore
+    }
+  }, [sessionId, draws]);
 
   const applyGame = useCallback((next: GameId) => {
     persistGame(next);
@@ -1078,10 +1163,24 @@ function App() {
     return () => clearInterval(interval);
   }, [sessionId, gameId, fetchDraws]);
 
+  useEffect(() => {
+    if (!sessionId || draws.length === 0) return;
+    settleBets();
+  }, [sessionId, draws, settleBets]);
+
   const recommendation = useMemo(
     () => buildRecommendations(draws, windowSize, pickCount, excludeLast),
     [draws, windowSize, pickCount, excludeLast]
   );
+
+  useEffect(() => {
+    if (!autoBetOn || !sessionId || draws.length === 0 || !recommendation.hasEnough) return;
+    const latestIssue = draws[0]?.issue;
+    if (!latestIssue || latestIssue === lastBetIssue) return;
+    const picks = recommendation.nextPicks;
+    if (picks.length === 0) return;
+    placeBet(latestIssue, picks);
+  }, [autoBetOn, sessionId, draws, recommendation, lastBetIssue, placeBet]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
@@ -1160,6 +1259,7 @@ function App() {
     { key: 'frequency', label: '号码频率', icon: BarChart3 },
     { key: 'trend', label: '走势分析', icon: TrendingUp },
     { key: 'profit', label: '盈亏模拟', icon: Wallet },
+    { key: 'autobet', label: '自动投注', icon: Zap },
   ];
 
   // Show login screen if not logged in
@@ -1478,6 +1578,32 @@ function App() {
                   martingaleOn={martingaleOn}
                   martingaleFactor={martingaleFactor}
                   martingaleReset={martingaleReset}
+                />
+              )}
+              {tab === 'autobet' && (
+                <AutoBetPanel
+                  sessionId={sessionId ?? ''}
+                  gameId={gameId}
+                  autoBetOn={autoBetOn}
+                  onToggleAutoBet={(on) => {
+                    persistAutoBetOn(on);
+                    setAutoBetOn(on);
+                  }}
+                  betAmount={betAmount}
+                  onBetAmountChange={(amount) => {
+                    persistBetAmount(amount);
+                    setBetAmount(amount);
+                  }}
+                  nextPicks={overview.nextPicks}
+                  nextIssue={draws[0]?.issue ?? null}
+                  draws={draws}
+                  onPlaceBet={() => {
+                    const issue = draws[0]?.issue;
+                    if (issue && overview.nextPicks.length > 0) {
+                      placeBet(issue, overview.nextPicks);
+                    }
+                  }}
+                  placingBet={placingBet}
                 />
               )}
             </div>
