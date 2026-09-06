@@ -297,7 +297,9 @@ function sum(nums: number[]): number {
 }
 
 function nextIssue(issue: string): string | null {
-  const match = issue.match(/^(\d{8})-(\d{1,4})$/);
+  const hyphenated = issue.match(/^(\d{8})-(\d{1,4})$/);
+  const compact = issue.match(/^(\d{8})(\d{1,4})$/);
+  const match = hyphenated ?? compact;
   if (!match) return null;
   const sequence = Number.parseInt(match[2], 10) + 1;
   return `${match[1]}-${sequence}`;
