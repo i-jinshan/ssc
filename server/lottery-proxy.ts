@@ -743,7 +743,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: 1,
+        LotteryGameID: lotteryId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
