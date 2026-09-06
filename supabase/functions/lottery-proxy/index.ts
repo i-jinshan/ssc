@@ -61,8 +61,8 @@ function mergeCookies(existing: string, newCookies: string): string {
 
 function getFormField(html: string, name: string): string | null {
   const patterns = [
-    new RegExp(`name=["']${name}["'][^>]*value=["']([^"']*)["']`, "i"),
-    new RegExp(`value=["']([^"']*)["'][^>]*name=["']${name}["']`, "i"),
+    new RegExp(`(?:name|id)=["']${name}["'][^>]*value=["']([^"']*)["']`, "i"),
+    new RegExp(`value=["']([^"']*)["'][^>]*(?:name|id)=["']${name}["']`, "i"),
   ];
   for (const regex of patterns) {
     const match = html.match(regex);
@@ -691,6 +691,10 @@ Deno.serve(async (req: Request) => {
         getFormField(betPage.text, "__RequestVerificationToken") ??
         (session as SessionRow).form_token ??
         "";
+      const pageLotteryGameId = Number(getFormField(betPage.text, "LotteryGameID"));
+      const targetLotteryGameId = Number.isFinite(pageLotteryGameId) && pageLotteryGameId > 0
+        ? pageLotteryGameId
+        : lotteryId;
       const betPageIsLogin = /ErrorHandle\/Timeout|top\.location\.href|<form[^>]+action=["']\/Account\/LoginVerify/i.test(
         betPage.text
       );
@@ -715,7 +719,7 @@ Deno.serve(async (req: Request) => {
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: lotteryId,
+        LotteryGameID: targetLotteryGameId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
