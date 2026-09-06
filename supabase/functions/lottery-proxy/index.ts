@@ -308,7 +308,13 @@ Deno.serve(async (req: Request) => {
       }
 
       const imgBuffer = await captchaImgResp.arrayBuffer();
-      const imgBase64 = btoa(String.fromCharCode(...new Uint8Array(imgBuffer)));
+      const imgBytes = new Uint8Array(imgBuffer);
+      let binary = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < imgBytes.length; i += chunk) {
+        binary += String.fromCharCode(...imgBytes.subarray(i, i + chunk));
+      }
+      const imgBase64 = btoa(binary);
       const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
 
       // Store session in Supabase

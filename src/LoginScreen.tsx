@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { Award, User, Lock, ShieldCheck, RefreshCw, Loader2, AlertCircle, Eye, EyeOff } from 'lucide-react';
-import { API_URL } from '@/api';
+import { API_URL, API_HEADERS } from '@/api';
 
 interface LoginScreenProps {
   onLoginSuccess: (sessionId: string) => void;
@@ -26,9 +26,7 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     setImgError(false);
     try {
       const resp = await fetch(`${API_URL}?action=captcha`, {
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: API_HEADERS,
       });
       const data = (await resp.json().catch(() => ({}))) as {
         error?: string;
@@ -65,9 +63,7 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     try {
       const resp = await fetch(`${API_URL}?action=login`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: API_HEADERS,
         body: JSON.stringify({
           sessionId,
           loginId: loginId.trim(),

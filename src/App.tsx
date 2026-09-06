@@ -11,7 +11,7 @@ import {
   Wallet,
 } from 'lucide-react';
 import { LoginScreen } from '@/LoginScreen';
-import { API_URL } from '@/api';
+import { API_URL, API_HEADERS } from '@/api';
 import type { DrawResult } from '@/lotteryData';
 
 type TabKey = 'table' | 'frequency' | 'trend' | 'profit';
@@ -1011,9 +1011,7 @@ function App() {
     try {
       const resp = await fetch(`${API_URL}?action=draws`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: API_HEADERS,
         body: JSON.stringify({ sessionId: sid, issueCount: 100, lotteryId }),
       });
 
