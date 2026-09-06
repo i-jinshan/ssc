@@ -1,4 +1,4 @@
-// Lottery proxy edge function
+// Lottery proxy edge function — real bet submission
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
