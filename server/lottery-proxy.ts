@@ -145,6 +145,14 @@ function getFormField(html: string, name: string): string | null {
   return null;
 }
 
+function randomHex4(): string {
+  return Math.floor((1 + Math.random()) * 65536).toString(16).substring(1);
+}
+
+function generateBetGuid(): string {
+  return randomHex4() + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
+}
+
 async function fetchWithCookies(
   url: string,
   cookieStr: string,
@@ -612,6 +620,53 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       );
     }
 
+    if (action === "betpage") {
+      const body = await req.json();
+      const { sessionId, lotteryId: lotteryIdRaw } = body as {
+        sessionId: string;
+        lotteryId?: number;
+      };
+      const lotteryId = resolveLotteryId(lotteryIdRaw);
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return new Response(
+          JSON.stringify({ error: "no session" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const cookies = session.cookies;
+      const pageUrl = LOTTERY_BASE + "/Home/Home";
+      const pageResp = await fetchWithCookies(pageUrl, cookies, {
+        redirect: "manual",
+      });
+      let currentCookies = pageResp.cookies;
+      for (let i = 0; i < 8; i++) {
+        if (pageResp.status < 300 || pageResp.status >= 400) break;
+        const location = pageResp.headers.get("location");
+        if (!location) break;
+        const redirectUrl = location.startsWith("http")
+          ? location
+          : LOTTERY_BASE + (location.startsWith("/") ? location : "/" + location);
+        const next = await fetchWithCookies(redirectUrl, currentCookies, { redirect: "manual" });
+        currentCookies = next.cookies;
+        break;
+      }
+
+      sessions.set(sessionId, { ...session, cookies: currentCookies });
+
+      return new Response(
+        JSON.stringify({
+          status: pageResp.status,
+          length: pageResp.text.length,
+          isLoginPage: /ErrorHandle\/Timeout|top\.location\.href|<form[^>]+action=["']\/Account\/LoginVerify/i.test(pageResp.text),
+          html: pageResp.text,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     if (action === "debug") {
       const body = await req.json();
       const { sessionId, lotteryId: lotteryIdRaw } = body as {
@@ -673,10 +728,74 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
-      const existing = bets.get(sessionId)?.find((b) => b.issue === issue);
-      if (existing) {
+      const session = sessions.get(sessionId);
+      if (!session) {
         return new Response(
-          JSON.stringify({ error: "该期已存在投注记录" }),
+          JSON.stringify({ error: "会话已过期，请重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const cookies = session.cookies;
+      const serialNumber = issue.replace("-", "");
+      const guid = generateBetGuid();
+      const unit = 2;
+      const multiple = Math.max(1, Math.round(betAmount / unit));
+
+      const betData = {
+        LotteryGameID: 1,
+        SerialNumber: serialNumber,
+        Bets: picks.map((n) => ({
+          BetTypeCode: 21,
+          BetTypeName: "",
+          Number: String(n),
+          Position: "5",
+          Unit: unit,
+          Multiple: multiple,
+          ReturnRate: 7.8,
+          IsCompressed: false,
+          NoCommission: false,
+        })),
+        Schedules: [],
+        StopIfWin: false,
+        BetMode: 0,
+        Guid: guid,
+        IsLoginByWeChat: false,
+      };
+
+      const betResp = await fetchWithCookies(
+        LOTTERY_BASE + "/Bet/Confirm?tgid=" + guid,
+        cookies,
+        {
+          method: "POST",
+          body: JSON.stringify(betData),
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
+          },
+        }
+      );
+
+      let betResult: unknown;
+      try {
+        betResult = JSON.parse(betResp.text);
+      } catch {
+        betResult = { raw: betResp.text.slice(0, 500) };
+      }
+
+      const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
+      if (isLoginRedirect) {
+        return new Response(
+          JSON.stringify({ error: "登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
+      if (hasError) {
+        return new Response(
+          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
@@ -703,7 +822,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       bets.get(sessionId)!.push(bet);
 
       return new Response(
-        JSON.stringify({ success: true, betId }),
+        JSON.stringify({ success: true, betId, betResult }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }

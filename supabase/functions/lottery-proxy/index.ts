@@ -1,4 +1,4 @@
-// Unused if you run locally: `npm run dev` serves server/lottery-proxy.ts instead.
+// Lottery proxy edge function
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
@@ -69,6 +69,14 @@ function getFormField(html: string, name: string): string | null {
     if (match) return match[1];
   }
   return null;
+}
+
+function randomHex4(): string {
+  return Math.floor((1 + Math.random()) * 65536).toString(16).substring(1);
+}
+
+function generateBetGuid(): string {
+  return randomHex4() + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
 }
 
 async function fetchWithCookies(
@@ -542,6 +550,59 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (action === "betpage") {
+      const body = await req.json();
+      const { sessionId, lotteryId: lotteryIdRaw } = body as {
+        sessionId: string;
+        lotteryId?: number;
+      };
+      const lotteryId = Number(lotteryIdRaw) || 128;
+
+      const { data: session } = await supabase
+        .from(SESSION_TABLE)
+        .select("*")
+        .eq("id", sessionId)
+        .maybeSingle();
+
+      if (!session) {
+        return new Response(
+          JSON.stringify({ error: "no session" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const cookies = (session as SessionRow).cookies;
+      const pageUrl = LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId;
+      const pageResp = await fetchWithCookies(pageUrl, cookies, { redirect: "manual" });
+      let currentCookies = pageResp.cookies;
+      for (let i = 0; i < 8; i++) {
+        if (pageResp.status < 300 || pageResp.status >= 400) break;
+        const location = pageResp.headers.get("location");
+        if (!location) break;
+        const redirectUrl = location.startsWith("http")
+          ? location
+          : LOTTERY_BASE + (location.startsWith("/") ? location : "/" + location);
+        const next = await fetchWithCookies(redirectUrl, currentCookies, { redirect: "manual" });
+        currentCookies = next.cookies;
+        break;
+      }
+
+      await supabase
+        .from(SESSION_TABLE)
+        .update({ cookies: currentCookies })
+        .eq("id", sessionId);
+
+      return new Response(
+        JSON.stringify({
+          status: pageResp.status,
+          length: pageResp.text.length,
+          isLoginPage: /ErrorHandle\/Timeout|top\.location\.href|<form[^>]+action=["']\/Account\/LoginVerify/i.test(pageResp.text),
+          html: pageResp.text,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     if (action === "debug") {
       const body = await req.json();
       const { sessionId } = body as { sessionId: string };
@@ -603,20 +664,88 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      const { data: existing } = await supabase
-        .from("lottery_bets")
-        .select("id")
-        .eq("session_id", sessionId)
-        .eq("issue", issue)
+      const { data: session } = await supabase
+        .from(SESSION_TABLE)
+        .select("*")
+        .eq("id", sessionId)
         .maybeSingle();
 
-      if (existing) {
+      if (!session) {
         return new Response(
-          JSON.stringify({ error: "该期已存在投注记录" }),
+          JSON.stringify({ error: "会话已过期，请重新登录" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
+      const cookies = (session as SessionRow).cookies;
+
+      // Normalize issue: convert "20260906-123" to "20260906123" for SerialNumber
+      const serialNumber = issue.replace("-", "");
+
+      // Build bet data model matching the target site's format
+      const guid = generateBetGuid();
+      const unit = 2;
+      const multiple = Math.max(1, Math.round(betAmount / unit));
+
+      const betData = {
+        LotteryGameID: 1,
+        SerialNumber: serialNumber,
+        Bets: picks.map((n) => ({
+          BetTypeCode: 21,
+          BetTypeName: "",
+          Number: String(n),
+          Position: "5",
+          Unit: unit,
+          Multiple: multiple,
+          ReturnRate: 7.8,
+          IsCompressed: false,
+          NoCommission: false,
+        })),
+        Schedules: [],
+        StopIfWin: false,
+        BetMode: 0,
+        Guid: guid,
+        IsLoginByWeChat: false,
+      };
+
+      const betResp = await fetchWithCookies(
+        LOTTERY_BASE + "/Bet/Confirm?tgid=" + guid,
+        cookies,
+        {
+          method: "POST",
+          body: JSON.stringify(betData),
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
+          },
+        }
+      );
+
+      let betResult: unknown;
+      try {
+        betResult = JSON.parse(betResp.text);
+      } catch {
+        betResult = { raw: betResp.text.slice(0, 500) };
+      }
+
+      const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
+      if (isLoginRedirect) {
+        return new Response(
+          JSON.stringify({ error: "登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
+      if (hasError) {
+        return new Response(
+          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Record the bet in our database
       const totalCost = betAmount * picks.length;
       const { data, error } = await supabase
         .from("lottery_bets")
@@ -634,13 +763,13 @@ Deno.serve(async (req: Request) => {
 
       if (error) {
         return new Response(
-          JSON.stringify({ error: "投注失败: " + error.message }),
+          JSON.stringify({ error: "投注记录保存失败: " + error.message, betResult }),
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       return new Response(
-        JSON.stringify({ success: true, betId: data.id }),
+        JSON.stringify({ success: true, betId: data.id, betResult }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }

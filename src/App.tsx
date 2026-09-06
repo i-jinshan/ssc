@@ -1127,9 +1127,11 @@ function App() {
       const data = await resp.json();
       if (data.success) {
         setLastBetIssue(issue);
+      } else if (data.error) {
+        setDrawsError(data.error);
       }
     } catch {
-      // ignore
+      setDrawsError('投注请求失败，请检查网络连接');
     } finally {
       setPlacingBet(false);
     }
