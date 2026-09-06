@@ -722,11 +722,14 @@ Deno.serve(async (req: Request) => {
         }
       );
 
-      let betResult: unknown;
-      try {
-        betResult = JSON.parse(betResp.text);
-      } catch {
-        betResult = { raw: betResp.text.slice(0, 500) };
+      // Only accept explicit success from the target site.
+      // Many failure modes (insufficient balance, bet closed, etc.) return HTTP 200
+      // with an error body or a non-JSON redirect, so we must verify carefully.
+      if (betResp.status !== 200) {
+        return new Response(
+          JSON.stringify({ error: `目标网站返回异常状态 ${betResp.status}` }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
 
       const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
@@ -737,15 +740,51 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
-      if (hasError) {
+      let betResult: Record<string, unknown> | null = null;
+      try {
+        betResult = JSON.parse(betResp.text);
+      } catch {
         return new Response(
-          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
+          JSON.stringify({ error: "目标网站未返回有效确认，投注可能未提交", raw: betResp.text.slice(0, 500) }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      if (typeof betResult !== "object" || betResult === null) {
+        return new Response(
+          JSON.stringify({ error: "目标网站返回格式异常" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Check for explicit error message from target site
+      const errMsg = (betResult as Record<string, unknown>).ErrorMessage;
+      if (typeof errMsg === "string" && errMsg) {
+        return new Response(
+          JSON.stringify({ error: errMsg }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
-      // Record the bet in our database
+      // Require explicit success signal from the target site.
+      // Accept common patterns: { Success: true }, { success: true }, { Code: 0/200 }, { Status: 0 }
+      const br = betResult as Record<string, unknown>;
+      const siteConfirmed =
+        br.Success === true ||
+        br.success === true ||
+        br.Code === 0 || br.Code === 200 ||
+        br.code === 0 || br.code === 200 ||
+        br.Status === 0 || br.status === 0 ||
+        br.IsSuccess === true;
+
+      if (!siteConfirmed) {
+        return new Response(
+          JSON.stringify({ error: "目标网站未确认投注成功，请到网站核实", betResult }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Target site explicitly confirmed — now record the bet
       const totalCost = betAmount * picks.length;
       const { data, error } = await supabase
         .from("lottery_bets")

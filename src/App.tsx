@@ -1137,19 +1137,6 @@ function App() {
     }
   }, [sessionId, gameId, betAmount]);
 
-  const settleBets = useCallback(async () => {
-    if (!sessionId || draws.length === 0) return;
-    try {
-      await fetch(`${API_URL}?action=betsettle`, {
-        method: 'POST',
-        headers: API_HEADERS,
-        body: JSON.stringify({ sessionId, draws: draws.slice(0, 30) }),
-      });
-    } catch {
-      // ignore
-    }
-  }, [sessionId, draws]);
-
   const applyGame = useCallback((next: GameId) => {
     persistGame(next);
     setGameId(next);
@@ -1164,11 +1151,6 @@ function App() {
     const interval = setInterval(() => fetchDraws(sessionId, gameId), 60000);
     return () => clearInterval(interval);
   }, [sessionId, gameId, fetchDraws]);
-
-  useEffect(() => {
-    if (!sessionId || draws.length === 0) return;
-    settleBets();
-  }, [sessionId, draws, settleBets]);
 
   const recommendation = useMemo(
     () => buildRecommendations(draws, windowSize, pickCount, excludeLast),
