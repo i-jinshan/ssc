@@ -372,6 +372,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     binary += String.fromCharCode(...imgBytes.subarray(i, i + chunkSize));
   }
   imgBase64 = btoa(binary);
+      const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
 
       const sessionId = crypto.randomUUID();
       sessions.set(sessionId, {
@@ -385,7 +386,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       return new Response(
         JSON.stringify({
           sessionId,
-          captchaImage: `data:image/gif;base64,${imgBase64}`,
+          captchaImage: `data:${contentType};base64,${imgBase64}`,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
