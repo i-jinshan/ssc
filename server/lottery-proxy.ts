@@ -150,7 +150,8 @@ function randomHex4(): string {
 }
 
 function generateBetGuid(): string {
-  return randomHex4() + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
+  const tabId = randomHex4() + randomHex4();
+  return tabId + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
 }
 
 async function fetchWithCookies(
@@ -765,6 +766,10 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       // Extract anti-forgery token from the bet page
       const betFormToken = getFormField(betPageResp.text, "__RequestVerificationToken");
 
+      // Extract the real internal lotteryGameId from the page (gid in URL is just navigation)
+      const gameIdMatch = betPageResp.text.match(/lotteryGameId\s*=\s*(\d+)/);
+      const realGameId = gameIdMatch ? parseInt(gameIdMatch[1], 10) : 1;
+
       // Persist updated cookies back to the session
       sessions.set(sessionId, { ...session, cookies: betPageCookies });
 
@@ -774,7 +779,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: lotteryId,
+        LotteryGameID: realGameId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
@@ -783,7 +788,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           Position: "5",
           Unit: unit,
           Multiple: multiple,
-          ReturnRate: 7.8,
+          ReturnRate: 0,
           IsCompressed: false,
           NoCommission: false,
         })),

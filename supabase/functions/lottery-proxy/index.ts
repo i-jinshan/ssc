@@ -76,7 +76,8 @@ function randomHex4(): string {
 }
 
 function generateBetGuid(): string {
-  return randomHex4() + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
+  const tabId = randomHex4() + randomHex4();
+  return tabId + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + "-" + randomHex4() + randomHex4() + randomHex4();
 }
 
 async function fetchWithCookies(
@@ -649,6 +650,134 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (action === "betdebug") {
+      const body = await req.json();
+      const { sessionId, lotteryId: lotteryIdRaw } = body as {
+        sessionId: string;
+        lotteryId?: number;
+      };
+      const lotteryId = Number(lotteryIdRaw) || 128;
+
+      const { data: session } = await supabase
+        .from(SESSION_TABLE)
+        .select("*")
+        .eq("id", sessionId)
+        .maybeSingle();
+
+      if (!session) {
+        return new Response(
+          JSON.stringify({ error: "no session" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const cookies = (session as SessionRow).cookies;
+      const pageUrl = LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId;
+      const pageResp = await fetchWithCookies(pageUrl, cookies, { redirect: "manual" });
+      let currentCookies = pageResp.cookies;
+      for (let i = 0; i < 8; i++) {
+        if (pageResp.status < 300 || pageResp.status >= 400) break;
+        const location = pageResp.headers.get("location");
+        if (!location) break;
+        const redirectUrl = location.startsWith("http")
+          ? location
+          : LOTTERY_BASE + (location.startsWith("/") ? location : "/" + location);
+        const next = await fetchWithCookies(redirectUrl, currentCookies, { redirect: "manual" });
+        currentCookies = next.cookies;
+        break;
+      }
+
+      const html = pageResp.text;
+      const isLoginPage = /ErrorHandle\/Timeout|top\.location\.href/i.test(html);
+
+      // Extract all <script src="..."> references
+      const scriptSrcs: string[] = [];
+      const srcRegex = /<script[^>]+src=["']([^"']+)["']/gi;
+      let srcMatch: RegExpExecArray | null;
+      while ((srcMatch = srcRegex.exec(html)) !== null) {
+        scriptSrcs.push(srcMatch[1]);
+      }
+
+      // Extract inline scripts that mention bet/confirm/submit
+      const inlineScripts: string[] = [];
+      const scriptRegex = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+      let scriptMatch: RegExpExecArray | null;
+      while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+        const code = scriptMatch[1].trim();
+        if (code.length === 0) continue;
+        // Only keep scripts that mention bet-related keywords
+        if (/bet|confirm|submit|ajax|post|Bet\/|SerialNumber|LotteryGameID|tgid|guid/i.test(code)) {
+          inlineScripts.push(code);
+        }
+      }
+
+      // Extract all form elements
+      const forms: { action: string; method: string; inputs: { name: string; value: string }[] }[] = [];
+      const formRegex = /<form[^>]*>/gi;
+      let formMatch: RegExpExecArray | null;
+      while ((formMatch = formRegex.exec(html)) !== null) {
+        const formTag = formMatch[0];
+        const actionMatch = formTag.match(/action=["']([^"']*)["']/i);
+        const methodMatch = formTag.match(/method=["']([^"']*)["']/i);
+        const formStart = formMatch.index ?? 0;
+        const formEnd = html.indexOf("</form>", formStart);
+        const formHtml = formEnd > 0 ? html.slice(formStart, formEnd) : html.slice(formStart, formStart + 2000);
+        const inputs: { name: string; value: string }[] = [];
+        const inputRegex = /<(?:input|select|textarea)[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["']/gi;
+        let inputMatch: RegExpExecArray | null;
+        while ((inputMatch = inputRegex.exec(formHtml)) !== null) {
+          inputs.push({ name: inputMatch[1], value: inputMatch[2] });
+        }
+        forms.push({
+          action: actionMatch?.[1] ?? "",
+          method: methodMatch?.[1] ?? "get",
+          inputs,
+        });
+      }
+
+      // Extract hidden inputs (anti-forgery tokens etc.)
+      const hiddenInputs: { name: string; value: string; id: string }[] = [];
+      const hiddenRegex = /<input[^>]*type=["']hidden["'][^>]*>/gi;
+      let hiddenMatch: RegExpExecArray | null;
+      while ((hiddenMatch = hiddenRegex.exec(html)) !== null) {
+        const tag = hiddenMatch[0];
+        const nameMatch = tag.match(/name=["']([^"']+)["']/i);
+        const valueMatch = tag.match(/value=["']([^"']*)["']/i);
+        const idMatch = tag.match(/id=["']([^"']+)["']/i);
+        if (nameMatch) {
+          hiddenInputs.push({
+            name: nameMatch[1],
+            value: valueMatch?.[1] ?? "",
+            id: idMatch?.[1] ?? "",
+          });
+        }
+      }
+
+      // Find any data-* attributes on bet-related elements
+      const dataAttrs: string[] = [];
+      const dataRegex = /data-(?:url|action|api|bet|game|issue|serial)[^=]*=["']([^"']+)["']/gi;
+      let dataMatch: RegExpExecArray | null;
+      while ((dataMatch = dataRegex.exec(html)) !== null) {
+        dataAttrs.push(dataMatch[0]);
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: pageResp.status,
+          length: html.length,
+          isLoginPage,
+          scriptSrcs,
+          inlineScriptsCount: inlineScripts.length,
+          inlineScripts,
+          forms,
+          hiddenInputs,
+          dataAttrs,
+          htmlHead: html.slice(0, 3000),
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     if (action === "bet") {
       const body = await req.json();
       const { sessionId, lotteryId, issue, picks, betAmount } = body as {
@@ -708,6 +837,10 @@ Deno.serve(async (req: Request) => {
       // Extract anti-forgery token from the bet page
       const betFormToken = getFormField(betPageResp.text, "__RequestVerificationToken");
 
+      // Extract the real internal lotteryGameId from the page (gid in URL is just navigation)
+      const gameIdMatch = betPageResp.text.match(/lotteryGameId\s*=\s*(\d+)/);
+      const realGameId = gameIdMatch ? parseInt(gameIdMatch[1], 10) : 1;
+
       // Persist updated cookies back to the session
       await supabase
         .from(SESSION_TABLE)
@@ -720,7 +853,7 @@ Deno.serve(async (req: Request) => {
       const multiple = Math.max(1, Math.round(betAmount / unit));
 
       const betData = {
-        LotteryGameID: lotteryId,
+        LotteryGameID: realGameId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
@@ -729,7 +862,7 @@ Deno.serve(async (req: Request) => {
           Position: "5",
           Unit: unit,
           Multiple: multiple,
-          ReturnRate: 7.8,
+          ReturnRate: 0,
           IsCompressed: false,
           NoCommission: false,
         })),
