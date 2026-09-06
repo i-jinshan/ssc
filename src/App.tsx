@@ -1039,6 +1039,7 @@ function App() {
   const [loadingDraws, setLoadingDraws] = useState(false);
   const [drawsError, setDrawsError] = useState('');
   const [betError, setBetError] = useState('');
+  const [betDebug, setBetDebug] = useState('');
   const [tab, setTab] = useState<TabKey>('table');
   const [search, setSearch] = useState('');
   const [windowSize, setWindowSize] = useState(readStoredWindow);
@@ -1140,11 +1141,12 @@ function App() {
       if (data.success) {
         setLastBetIssue(issue);
         setBetError('');
+        setBetDebug('');
       } else if (data.error) {
-        setBetError(data.error);
+        setBetError(`${data.error}（接口状态 ${resp.status}）`);
       }
       if (data.debug) {
-        console.log('bet debug', data.debug);
+        setBetDebug(JSON.stringify(data.debug, null, 2));
       }
     } catch {
       setBetError('投注请求失败，请检查网络连接');
@@ -1436,12 +1438,21 @@ function App() {
               <span>{betError}</span>
             </div>
             <button
-              onClick={() => setBetError('')}
+              onClick={() => {
+                setBetError('');
+                setBetDebug('');
+              }}
               className="flex-shrink-0 text-rose-400 transition hover:text-rose-600"
             >
               <X className="h-4 w-4" />
             </button>
           </div>
+        )}
+
+        {betDebug && (
+          <pre className="mb-6 max-h-72 overflow-auto whitespace-pre-wrap rounded-xl border border-amber-200 bg-amber-50 px-5 py-4 text-xs text-amber-900">
+            {betDebug}
+          </pre>
         )}
 
         {/* Loading state */}
