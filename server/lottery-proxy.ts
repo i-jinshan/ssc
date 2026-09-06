@@ -737,6 +737,37 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       }
 
       const cookies = session.cookies;
+
+      // Step 1: Load the bet page first to establish session state and get anti-forgery token
+      const betPageUrl = LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId;
+      const betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
+      let betPageCookies = betPageResp.cookies;
+      for (let i = 0; i < 8; i++) {
+        if (betPageResp.status < 300 || betPageResp.status >= 400) break;
+        const location = betPageResp.headers.get("location");
+        if (!location) break;
+        const redirectUrl = location.startsWith("http")
+          ? location
+          : LOTTERY_BASE + (location.startsWith("/") ? location : "/" + location);
+        const next = await fetchWithCookies(redirectUrl, betPageCookies, { redirect: "manual" });
+        betPageCookies = next.cookies;
+        break;
+      }
+
+      const isBetPageLogin = /ErrorHandle\/Timeout|top\.location\.href/i.test(betPageResp.text);
+      if (isBetPageLogin) {
+        return new Response(
+          JSON.stringify({ error: "登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Extract anti-forgery token from the bet page
+      const betFormToken = getFormField(betPageResp.text, "__RequestVerificationToken");
+
+      // Persist updated cookies back to the session
+      sessions.set(sessionId, { ...session, cookies: betPageCookies });
+
       const serialNumber = issue.replace("-", "");
       const guid = generateBetGuid();
       const unit = 2;
@@ -765,14 +796,15 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
       const betResp = await fetchWithCookies(
         LOTTERY_BASE + "/Bet/Confirm?tgid=" + guid,
-        cookies,
+        betPageCookies,
         {
           method: "POST",
           body: JSON.stringify(betData),
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             "X-Requested-With": "XMLHttpRequest",
-            Referer: LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId,
+            Referer: betPageUrl,
+            ...(betFormToken ? { "__RequestVerificationToken": betFormToken } : {}),
           },
         }
       );
