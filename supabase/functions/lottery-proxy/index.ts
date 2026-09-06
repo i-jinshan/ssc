@@ -720,6 +720,30 @@ Deno.serve(async (req: Request) => {
         }
       );
 
+      if (betResp.status !== 200) {
+        const targetMessage = betResp.text
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]*>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 500);
+        return new Response(
+          JSON.stringify({
+            error: targetMessage
+              ? `目标网站拒绝投注（${betResp.status}）：${targetMessage}`
+              : `目标网站拒绝投注（状态 ${betResp.status}）`,
+            debug: {
+              status: betResp.status,
+              rawResponse: betResp.text.slice(0, 1000),
+              sentBetData: betData,
+              serialNumber,
+            },
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
       const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
       if (isLoginRedirect) {
         return new Response(
@@ -728,20 +752,53 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      let betResult: unknown;
+      let betResult: Record<string, unknown> | null = null;
       try {
         betResult = JSON.parse(betResp.text);
       } catch {
-        betResult = { raw: betResp.text.slice(0, 500) };
+        return new Response(
+          JSON.stringify({
+            error: "目标网站未返回有效确认，投注可能未提交",
+            debug: { raw: betResp.text.slice(0, 500), sentBetData: betData },
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
 
-      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
-      if (hasError) {
+      if (typeof betResult !== "object" || betResult === null) {
         return new Response(
-          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
+          JSON.stringify({ error: "目标网站返回格式异常", betResult }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const errMsg = (betResult as Record<string, unknown>).ErrorMessage;
+      if (typeof errMsg === "string" && errMsg) {
+        return new Response(
+          JSON.stringify({ error: errMsg }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
+
+      const br = betResult as Record<string, unknown>;
+      const siteConfirmed =
+        br.Success === true ||
+        br.success === true ||
+        br.Code === 0 || br.Code === 200 ||
+        br.code === 0 || br.code === 200 ||
+        br.Status === 0 || br.status === 0 ||
+        br.IsSuccess === true;
+
+      if (!siteConfirmed) {
+        return new Response(
+          JSON.stringify({
+            error: "目标网站未确认投注成功，请到网站核实",
+            debug: { betResult, sentBetData: betData },
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
       const totalCost = betAmount * picks.length;
       const { data, error } = await supabase
         .from("lottery_bets")
