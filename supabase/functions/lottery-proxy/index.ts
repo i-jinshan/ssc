@@ -901,9 +901,9 @@ Deno.serve(async (req: Request) => {
         LotteryGameID: realGameId,
         SerialNumber: serialNumber,
         Bets: picks.map((n) => ({
-          BetTypeCode: 16,
+          BetTypeCode: 21,
           BetTypeName: "",
-          Number: String(n),
+          Number: ",,,," + String(n),
           Position: "5",
           Unit: unit,
           Multiple: multiple,
