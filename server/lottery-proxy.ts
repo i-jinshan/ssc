@@ -770,6 +770,38 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       const gameIdMatch = betPageResp.text.match(/lotteryGameId\s*=\s*(\d+)/);
       const realGameId = gameIdMatch ? parseInt(gameIdMatch[1], 10) : 1;
 
+      // Step 2: POST /Bet/GameInfo — tells the server which game is active
+      const gameInfoResp = await fetchWithCookies(
+        LOTTERY_BASE + "/Bet/GameInfo",
+        betPageCookies,
+        {
+          method: "POST",
+          body: "lotteryGameId=" + realGameId,
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: betPageUrl,
+          },
+        }
+      );
+      betPageCookies = gameInfoResp.cookies;
+
+      // Step 3: POST /Bet/GetBetParameters — loads bet parameters for the game
+      const betParamsResp = await fetchWithCookies(
+        LOTTERY_BASE + "/Bet/GetBetParameters",
+        betPageCookies,
+        {
+          method: "POST",
+          body: "gameURLID=" + lotteryId,
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: betPageUrl,
+          },
+        }
+      );
+      betPageCookies = betParamsResp.cookies;
+
       // Persist updated cookies back to the session
       sessions.set(sessionId, { ...session, cookies: betPageCookies });
 
