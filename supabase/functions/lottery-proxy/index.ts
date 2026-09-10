@@ -812,8 +812,9 @@ Deno.serve(async (req: Request) => {
 
       // Step 1: Load the bet page first to establish session state and get anti-forgery token
       const betPageUrl = LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId;
-      const betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
+      let betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
       let betPageCookies = betPageResp.cookies;
+      let betPageHtml = betPageResp.text;
       for (let i = 0; i < 8; i++) {
         if (betPageResp.status < 300 || betPageResp.status >= 400) break;
         const location = betPageResp.headers.get("location");
@@ -823,10 +824,12 @@ Deno.serve(async (req: Request) => {
           : LOTTERY_BASE + (location.startsWith("/") ? location : "/" + location);
         const next = await fetchWithCookies(redirectUrl, betPageCookies, { redirect: "manual" });
         betPageCookies = next.cookies;
+        betPageHtml = next.text;
+        betPageResp = next;
         break;
       }
 
-      const isBetPageLogin = /ErrorHandle\/Timeout|top\.location\.href/i.test(betPageResp.text);
+      const isBetPageLogin = /ErrorHandle\/Timeout|top\.location\.href/i.test(betPageHtml);
       if (isBetPageLogin) {
         return new Response(
           JSON.stringify({ error: "登录已过期，请重新登录" }),
@@ -835,11 +838,10 @@ Deno.serve(async (req: Request) => {
       }
 
       // Extract anti-forgery token from the bet page
-      const betFormToken = getFormField(betPageResp.text, "__RequestVerificationToken");
+      const betFormToken = getFormField(betPageHtml, "__RequestVerificationToken");
 
-      // Extract the real internal lotteryGameId from the page (gid in URL is just navigation)
-      const gameIdMatch = betPageResp.text.match(/lotteryGameId\s*=\s*(\d+)/);
-      const realGameId = gameIdMatch ? parseInt(gameIdMatch[1], 10) : 1;
+      // lotteryId (60/127/128) IS the LottoGame enum value — use it directly
+      const realGameId = lotteryId;
 
       // Step 2: POST /Bet/GameInfo — tells the server which game is active
       const gameInfoResp = await fetchWithCookies(
@@ -872,6 +874,17 @@ Deno.serve(async (req: Request) => {
         }
       );
       betPageCookies = betParamsResp.cookies;
+
+      const debugInfo: Record<string, unknown> = {
+        realGameId,
+        lotteryId,
+        betPageStatus: betPageResp.status,
+        gameInfoStatus: gameInfoResp.status,
+        gameInfoBody: gameInfoResp.text.slice(0, 500),
+        betParamsStatus: betParamsResp.status,
+        betParamsBody: betParamsResp.text.slice(0, 500),
+        betFormToken: betFormToken ? "found" : "missing",
+      };
 
       // Persist updated cookies back to the session
       await supabase
@@ -934,8 +947,9 @@ Deno.serve(async (req: Request) => {
               ? `目标网站拒绝投注（${betResp.status}）：${targetMessage}`
               : `目标网站拒绝投注（状态 ${betResp.status}）`,
             debug: {
-              status: betResp.status,
-              rawResponse: betResp.text.slice(0, 1000),
+              ...debugInfo,
+              confirmStatus: betResp.status,
+              confirmResponse: betResp.text.slice(0, 1000),
               sentBetData: betData,
               serialNumber,
             },
@@ -975,7 +989,10 @@ Deno.serve(async (req: Request) => {
       const errMsg = (betResult as Record<string, unknown>).ErrorMessage;
       if (typeof errMsg === "string" && errMsg) {
         return new Response(
-          JSON.stringify({ error: errMsg }),
+          JSON.stringify({
+            error: errMsg,
+            debug: { ...debugInfo, betResult },
+          }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
