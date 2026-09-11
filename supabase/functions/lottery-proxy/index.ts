@@ -1213,11 +1213,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (action === "xylogin") {
+    // Step 1: username + captcha → returns greeting text
+    if (action === "xystep1") {
       const XY_BASE = "https://s.xybet00.com";
       const body = await req.json();
-      const { sessionId, loginId, password, captchaInput } = body as {
-        sessionId: string; loginId: string; password: string; captchaInput: string;
+      const { sessionId, loginId, captchaInput } = body as {
+        sessionId: string; loginId: string; captchaInput: string;
       };
       const { data: session, error: sessionError } = await supabase
         .from(SESSION_TABLE).select("*").eq("id", sessionId).maybeSingle();
@@ -1228,14 +1229,84 @@ Deno.serve(async (req: Request) => {
         );
       }
       const row = session as SessionRow & { form_token: string; captcha_de_text: string };
-      const loginBody = new URLSearchParams({
+      const step1Body = new URLSearchParams({
         __RequestVerificationToken: row.form_token ?? "",
-        LoginID: loginId, Password: password,
-        CaptchaDeText: row.captcha_de_text ?? "", CaptchaInputText: captchaInput,
+        LoginID: loginId,
+        CaptchaDeText: row.captcha_de_text ?? "",
+        CaptchaInputText: captchaInput,
+      }).toString();
+      const step1Resp = await fetchWithCookies(XY_BASE + "/Account/LoginVerify", row.cookies, {
+        method: "POST", body: step1Body,
+        headers: { "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/x-www-form-urlencoded", Referer: XY_BASE + "/Login" },
+      });
+      const respText = step1Resp.text;
+      const hasError = /field-validation-error|验证码错误|帐号或密码|账号或密码|登录失败|登入失败|密码错误|错误/i.test(respText);
+      if (hasError) {
+        let errorMsg = "验证失败，请检查用户名和验证码";
+        if (/验证码/i.test(respText)) errorMsg = "验证码错误";
+        else if (/帐号或密码|账号或密码|密码错误/i.test(respText)) errorMsg = "账号不存在";
+        return new Response(
+          JSON.stringify({ success: false, error: errorMsg }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      let greeting = "";
+      try {
+        const parsed = JSON.parse(respText);
+        if (typeof parsed === "object" && parsed !== null) {
+          greeting = (parsed as Record<string, unknown>).greeting as string
+            || (parsed as Record<string, unknown>).Greeting as string
+            || (parsed as Record<string, unknown>).message as string
+            || (parsed as Record<string, unknown>).Message as string
+            || "";
+        }
+      } catch {
+        const greetingMatch = respText.match(/问候语[:：\s]*([^\s<]+)/i);
+        if (greetingMatch) greeting = greetingMatch[1];
+        if (!greeting) {
+          const welcomeMatch = respText.match(/欢迎[^<]*/i);
+          if (welcomeMatch) greeting = welcomeMatch[0];
+        }
+      }
+      await supabase.from(SESSION_TABLE).update({ cookies: step1Resp.cookies, login_id: loginId }).eq("id", sessionId);
+      return new Response(
+        JSON.stringify({ success: true, greeting, sessionId }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Step 2: password + confirm greeting → complete login
+    if (action === "xystep2") {
+      const XY_BASE = "https://s.xybet00.com";
+      const body = await req.json();
+      const { sessionId, password } = body as {
+        sessionId: string; password: string;
+      };
+      const { data: session, error: sessionError } = await supabase
+        .from(SESSION_TABLE).select("*").eq("id", sessionId).maybeSingle();
+      if (sessionError || !session) {
+        return new Response(
+          JSON.stringify({ error: "请先完成第一步验证" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const row = session as SessionRow & { form_token: string; captcha_de_text: string; login_id: string };
+      if (!row.login_id) {
+        return new Response(
+          JSON.stringify({ error: "请先完成第一步验证" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const step2Body = new URLSearchParams({
+        __RequestVerificationToken: row.form_token ?? "",
+        LoginID: row.login_id,
+        Password: password,
+        CaptchaDeText: row.captcha_de_text ?? "",
+        CaptchaInputText: "",
       }).toString();
       const loginResp = await fetchWithCookies(XY_BASE + "/Account/LoginVerify", row.cookies, {
-        method: "POST", body: loginBody,
-        headers: { "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/x-www-form-urlencoded", Referer: XY_BASE + "/" },
+        method: "POST", body: step2Body,
+        headers: { "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/x-www-form-urlencoded", Referer: XY_BASE + "/Login" },
       });
       const isRedirect = loginResp.status >= 300 && loginResp.status < 400;
       const hasError = /field-validation-error|验证码错误|帐号或密码|账号或密码|登录失败|登入失败|密码错误/i.test(loginResp.text);
@@ -1267,9 +1338,8 @@ Deno.serve(async (req: Request) => {
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       } else {
-        let errorMsg = "星亿娱乐登录失败，请检查账号密码和验证码";
-        if (/验证码/i.test(loginResp.text)) errorMsg = "验证码错误";
-        else if (/帐号或密码|账号或密码|密码错误/i.test(loginResp.text)) errorMsg = "账号或密码错误";
+        let errorMsg = "登录失败，请检查密码";
+        if (/密码错误/i.test(loginResp.text)) errorMsg = "密码错误";
         return new Response(
           JSON.stringify({ success: false, error: errorMsg }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }

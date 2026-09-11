@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff } from 'lucide-react';
+import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft } from 'lucide-react';
 import { API_URL, API_HEADERS } from '@/api';
 import { NumberBall, ballColor } from '@/App';
 
@@ -432,11 +432,13 @@ interface XyLoginModalProps {
 }
 
 function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
+  const [step, setStep] = useState<1 | 2>(1);
   const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
   const [captchaInput, setCaptchaInput] = useState('');
   const [captchaImage, setCaptchaImage] = useState('');
   const [sessionId, setSessionId] = useState('');
+  const [greeting, setGreeting] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingCaptcha, setLoadingCaptcha] = useState(false);
@@ -469,30 +471,31 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
     fetchCaptcha();
   }, [fetchCaptcha]);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  // Step 1: submit username + captcha → get greeting
+  const handleStep1 = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!loginId.trim() || !password.trim() || !captchaInput.trim()) {
-      setError('请填写所有栏位');
+    if (!loginId.trim() || !captchaInput.trim()) {
+      setError('请填写帐号和验证码');
       return;
     }
     setLoading(true);
     setError('');
     try {
-      const resp = await fetch(`${API_URL}?action=xylogin`, {
+      const resp = await fetch(`${API_URL}?action=xystep1`, {
         method: 'POST',
         headers: API_HEADERS,
         body: JSON.stringify({
           sessionId,
           loginId: loginId.trim(),
-          password: password.trim(),
           captchaInput: captchaInput.trim(),
         }),
       });
       const data = await resp.json();
       if (data.success) {
-        onSuccess(data.sessionId);
+        setGreeting(data.greeting || '请确认问候语');
+        setStep(2);
       } else {
-        setError(data.error || '星亿娱乐登录失败');
+        setError(data.error || '验证失败');
         fetchCaptcha();
       }
     } catch {
@@ -501,6 +504,45 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Step 2: submit password → complete login
+  const handleStep2 = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!password.trim()) {
+      setError('请输入密码');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const resp = await fetch(`${API_URL}?action=xystep2`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({
+          sessionId,
+          password: password.trim(),
+        }),
+      });
+      const data = await resp.json();
+      if (data.success) {
+        onSuccess(data.sessionId);
+      } else {
+        setError(data.error || '登录失败');
+      }
+    } catch {
+      setError('网络错误，请重试');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const backToStep1 = () => {
+    setStep(1);
+    setPassword('');
+    setError('');
+    setGreeting('');
+    fetchCaptcha();
   };
 
   return (
@@ -518,7 +560,20 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
             <ShieldCheck className="h-7 w-7 text-white" />
           </div>
           <h2 className="text-xl font-bold text-slate-800">登录星亿娱乐</h2>
-          <p className="mt-1 text-sm text-slate-500">登录后可对星亿娱乐进行自动投注</p>
+          <p className="mt-1 text-sm text-slate-500">
+            {step === 1 ? '第一步：输入帐号和验证码' : '第二步：确认问候语并输入密码'}
+          </p>
+        </div>
+
+        {/* Step indicator */}
+        <div className="mb-6 flex items-center justify-center gap-2">
+          <div className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${step === 1 ? 'bg-emerald-500 text-white' : 'bg-emerald-100 text-emerald-600'}`}>
+            {step === 1 ? '1' : <CheckCircle2 className="h-4 w-4" />}
+          </div>
+          <div className={`h-1 w-12 rounded ${step === 2 ? 'bg-emerald-400' : 'bg-slate-200'}`} />
+          <div className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${step === 2 ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-400'}`}>
+            2
+          </div>
         </div>
 
         {error && (
@@ -528,101 +583,152 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
           </div>
         )}
 
-        <form onSubmit={handleLogin} className="space-y-5">
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-slate-600">帐号</label>
-            <div className="relative">
-              <User className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={loginId}
-                onChange={(e) => setLoginId(e.target.value)}
-                placeholder="请输入星亿娱乐帐号"
-                autoComplete="username"
-                className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
-              />
-            </div>
-          </div>
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-slate-600">密码</label>
-            <div className="relative">
-              <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="请输入密码"
-                autoComplete="current-password"
-                className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-11 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((v) => !v)}
-                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-slate-600"
-              >
-                {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
-              </button>
-            </div>
-          </div>
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-slate-600">验证码</label>
-            <div className="flex gap-3">
-              <div className="relative flex-1">
-                <ShieldCheck className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+        {/* Step 1: username + captcha */}
+        {step === 1 && (
+          <form onSubmit={handleStep1} className="space-y-5">
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">帐号</label>
+              <div className="relative">
+                <User className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
                 <input
                   type="text"
-                  value={captchaInput}
-                  onChange={(e) => setCaptchaInput(e.target.value)}
-                  placeholder="请输入验证码"
-                  maxLength={6}
+                  value={loginId}
+                  onChange={(e) => setLoginId(e.target.value)}
+                  placeholder="请输入星亿娱乐帐号"
+                  autoComplete="username"
                   className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
                 />
               </div>
+            </div>
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">验证码</label>
+              <div className="flex gap-3">
+                <div className="relative flex-1">
+                  <ShieldCheck className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    value={captchaInput}
+                    onChange={(e) => setCaptchaInput(e.target.value)}
+                    placeholder="请输入验证码"
+                    maxLength={6}
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={fetchCaptcha}
+                  disabled={loadingCaptcha}
+                  className="relative h-[46px] w-32 flex-shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 transition hover:border-emerald-300 disabled:opacity-50"
+                  title="点击刷新验证码"
+                >
+                  {loadingCaptcha ? (
+                    <div className="flex h-full items-center justify-center">
+                      <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+                    </div>
+                  ) : captchaImage && !imgError ? (
+                    <img
+                      src={captchaImage}
+                      alt="验证码"
+                      className="h-full w-full object-cover"
+                      onError={() => {
+                        setImgError(true);
+                        setError('验证码图片加载失败，正在重试…');
+                        setTimeout(() => fetchCaptcha(), 1500);
+                      }}
+                    />
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-slate-400">
+                      <RefreshCw className="h-5 w-5" />
+                    </div>
+                  )}
+                </button>
+              </div>
+            </div>
+            <button
+              type="submit"
+              disabled={loading || loadingCaptcha}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 py-3 font-semibold text-white shadow-lg shadow-emerald-500/20 transition hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  验证中…
+                </>
+              ) : (
+                <>
+                  下一步
+                  <ArrowRight className="h-4 w-4" />
+                </>
+              )}
+            </button>
+          </form>
+        )}
+
+        {/* Step 2: greeting confirmation + password */}
+        {step === 2 && (
+          <form onSubmit={handleStep2} className="space-y-5">
+            {/* Greeting display */}
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+              <div className="flex items-start gap-3">
+                <CheckCircle2 className="mt-0.5 h-5 w-5 flex-shrink-0 text-emerald-500" />
+                <div>
+                  <p className="text-sm font-medium text-emerald-800">问候语确认</p>
+                  <p className="mt-1 text-lg font-semibold text-emerald-700">{greeting}</p>
+                  <p className="mt-1 text-xs text-emerald-600">请确认以上问候语是否正确，然后输入密码完成登录</p>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">密码</label>
+              <div className="relative">
+                <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="请输入密码"
+                  autoComplete="current-password"
+                  autoFocus
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-11 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((v) => !v)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-slate-600"
+                >
+                  {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
               <button
                 type="button"
-                onClick={fetchCaptcha}
-                disabled={loadingCaptcha}
-                className="relative h-[46px] w-32 flex-shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 transition hover:border-emerald-300 disabled:opacity-50"
-                title="点击刷新验证码"
+                onClick={backToStep1}
+                disabled={loading}
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 px-4 py-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-50"
               >
-                {loadingCaptcha ? (
-                  <div className="flex h-full items-center justify-center">
-                    <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
-                  </div>
-                ) : captchaImage && !imgError ? (
-                  <img
-                    src={captchaImage}
-                    alt="验证码"
-                    className="h-full w-full object-cover"
-                    onError={() => {
-                      setImgError(true);
-                      setError('验证码图片加载失败，正在重试…');
-                      setTimeout(() => fetchCaptcha(), 1500);
-                    }}
-                  />
+                <ArrowLeft className="h-4 w-4" />
+                返回
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 py-3 font-semibold text-white shadow-lg shadow-emerald-500/20 transition hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    登录中…
+                  </>
                 ) : (
-                  <div className="flex h-full items-center justify-center text-slate-400">
-                    <RefreshCw className="h-5 w-5" />
-                  </div>
+                  '确认登录'
                 )}
               </button>
             </div>
-          </div>
-          <button
-            type="submit"
-            disabled={loading || loadingCaptcha}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 py-3 font-semibold text-white shadow-lg shadow-emerald-500/20 transition hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {loading ? (
-              <>
-                <Loader2 className="h-5 w-5 animate-spin" />
-                登录中…
-              </>
-            ) : (
-              '登录星亿娱乐'
-            )}
-          </button>
-        </form>
+          </form>
+        )}
       </div>
     </div>
   );
