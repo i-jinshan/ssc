@@ -31,6 +31,8 @@ interface SessionRow {
   cookies: string;
   form_token: string | null;
   captcha_de_text: string | null;
+  captcha_code?: string;
+  login_token?: string;
   authenticated: boolean;
   login_id?: string;
 }
@@ -1009,78 +1011,59 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     }
 
     // ── 星亿娱乐 (xybet) platform ──
+    // XY is a Vue SPA with a REST API. Login flow:
+    // 1. POST /api/GraphicsCaptcha/Create → { ImageBase64Str, Data }
+    // 2. POST /api/Token/GetGreetins { LoginId, GraphicsCaptcha:{Code,Data} } → { Result, Greetings, GraphicsResult }
+    // 3. POST /api/Token/Login { LoginId, Password, GraphicsCaptcha:{Code,Data} } → { Result, Token, ... }
+
+    const XY_BASE = "https://s.xybet00.com";
+
+    async function xyApi(path: string, body: unknown, cookieStr: string): Promise<{ data: Record<string, unknown>; cookies: string; status: number }> {
+      const resp = await lotteryFetch(XY_BASE + path, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/json",
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: XY_BASE + "/",
+          ...(cookieStr ? { Cookie: cookieStr } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+      const newCookies = parseSetCookie(resp.headers);
+      const merged = mergeCookies(cookieStr, newCookies);
+      const text = await resp.text();
+      let data: Record<string, unknown> = {};
+      try { data = JSON.parse(text); } catch { data = { rawText: text }; }
+      return { data, cookies: merged, status: resp.status };
+    }
 
     if (action === "xycaptcha") {
-      const XY_BASE = "https://s.xybet00.com";
-      const home = await fetchWithCookies(XY_BASE + "/", "", { redirect: "follow" });
-      const formToken = getFormField(home.text, "__RequestVerificationToken");
-      const captchaFrag = await fetchWithCookies(
-        XY_BASE + "/Account/Captcha",
-        home.cookies,
-        {
-          method: "POST",
-          body: "CaptchaError=False",
-          headers: {
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded",
-            Referer: XY_BASE + "/",
-          },
-        }
-      );
-      const captchaDeText = getFormField(captchaFrag.text, "CaptchaDeText");
-      if (!captchaDeText) {
+      const captchaResp = await xyApi("/api/GraphicsCaptcha/Create", {}, "");
+      const img = captchaResp.data.ImageBase64Str as string | undefined;
+      const captchaData = captchaResp.data.Data as string | undefined;
+      if (!img || !captchaData) {
         return new Response(
-          JSON.stringify({ error: "无法获取星亿娱乐验证码令牌" }),
+          JSON.stringify({ error: "无法获取星亿娱乐验证码" }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      const captchaImgResp = await lotteryFetch(
-        XY_BASE + "/DefaultCaptcha/Generate?t=" + captchaDeText,
-        {
-          headers: {
-            "User-Agent": UA,
-            Cookie: captchaFrag.cookies,
-            Referer: XY_BASE + "/",
-          },
-        }
-      );
-      if (!captchaImgResp.ok) {
-        return new Response(
-          JSON.stringify({ error: `获取星亿娱乐验证码图片失败 (${captchaImgResp.status})` }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      const imgBuffer = await captchaImgResp.arrayBuffer();
-      const imgBytes = new Uint8Array(imgBuffer);
-      let imgBase64: string;
-      if (typeof Buffer !== "undefined") {
-        imgBase64 = Buffer.from(imgBuffer).toString("base64");
-      } else {
-        let binary = "";
-        const chunk = 0x8000;
-        for (let i = 0; i < imgBytes.length; i += chunk) {
-          binary += String.fromCharCode(...imgBytes.subarray(i, i + chunk));
-        }
-        imgBase64 = btoa(binary);
-      }
-      const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
       const xySessionId = crypto.randomUUID();
       sessions.set(xySessionId, {
         id: xySessionId,
-        cookies: captchaFrag.cookies,
-        form_token: formToken,
-        captcha_de_text: captchaDeText,
+        cookies: captchaResp.cookies,
+        captcha_de_text: captchaData,
         authenticated: false,
       });
       return new Response(
-        JSON.stringify({ sessionId: xySessionId, captchaImage: `data:${contentType};base64,${imgBase64}` }),
+        JSON.stringify({ sessionId: xySessionId, captchaImage: img }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     // Step 1: username + captcha → returns greeting text
     if (action === "xystep1") {
-      const XY_BASE = "https://s.xybet00.com";
       const body = await req.json();
       const { sessionId, loginId, captchaInput } = body as {
         sessionId: string; loginId: string; captchaInput: string;
@@ -1092,53 +1075,28 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      const step1Body = new URLSearchParams({
-        __RequestVerificationToken: session.form_token ?? "",
-        LoginID: loginId,
-        CaptchaDeText: session.captcha_de_text ?? "",
-        CaptchaInputText: captchaInput,
-      }).toString();
-      const step1Resp = await fetchWithCookies(XY_BASE + "/Account/LoginVerify", session.cookies, {
-        method: "POST",
-        body: step1Body,
-        headers: {
-          "X-Requested-With": "XMLHttpRequest",
-          "Content-Type": "application/x-www-form-urlencoded",
-          Referer: XY_BASE + "/Login",
-        },
-      });
-      const respText = step1Resp.text;
-      const hasError = /field-validation-error|验证码错误|帐号或密码|账号或密码|登录失败|登入失败|密码错误|错误/i.test(respText);
-      if (hasError) {
-        let errorMsg = "验证失败，请检查用户名和验证码";
-        if (/验证码/i.test(respText)) errorMsg = "验证码错误";
-        else if (/帐号或密码|账号或密码|密码错误/i.test(respText)) errorMsg = "账号不存在";
+      const greetResp = await xyApi("/api/Token/GetGreetins", {
+        LoginId: loginId,
+        GraphicsCaptcha: { Code: captchaInput, Data: session.captcha_de_text ?? "" },
+        IsGestureLogin: false,
+      }, session.cookies ?? "");
+
+      const graphicsResult = greetResp.data.GraphicsResult as number | undefined;
+      if (graphicsResult !== undefined && graphicsResult !== 0) {
         return new Response(
-          JSON.stringify({ success: false, error: errorMsg }),
+          JSON.stringify({ success: false, error: "验证码错误" }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      // Extract greeting from response — could be JSON or HTML
-      let greeting = "";
-      try {
-        const parsed = JSON.parse(respText);
-        if (typeof parsed === "object" && parsed !== null) {
-          greeting = (parsed as Record<string, unknown>).greeting as string
-            || (parsed as Record<string, unknown>).Greeting as string
-            || (parsed as Record<string, unknown>).message as string
-            || (parsed as Record<string, unknown>).Message as string
-            || "";
-        }
-      } catch {
-        // HTML response — look for greeting patterns
-        const greetingMatch = respText.match(/问候语[:：\s]*([^\s<]+)/i);
-        if (greetingMatch) greeting = greetingMatch[1];
-        if (!greeting) {
-          const welcomeMatch = respText.match(/欢迎[^<]*/i);
-          if (welcomeMatch) greeting = welcomeMatch[0];
-        }
+      const result = greetResp.data.Result as boolean | undefined;
+      if (!result) {
+        return new Response(
+          JSON.stringify({ success: false, error: "帐号不存在或验证码错误" }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
-      sessions.set(sessionId, { ...session, cookies: step1Resp.cookies, login_id: loginId });
+      const greeting = (greetResp.data.Greetings as string) || "请确认问候语";
+      sessions.set(sessionId, { ...session, cookies: greetResp.cookies, login_id: loginId, captcha_code: captchaInput });
       return new Response(
         JSON.stringify({ success: true, greeting, sessionId }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -1147,7 +1105,6 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     // Step 2: password + confirm greeting → complete login
     if (action === "xystep2") {
-      const XY_BASE = "https://s.xybet00.com";
       const body = await req.json();
       const { sessionId, password } = body as {
         sessionId: string; password: string;
@@ -1159,59 +1116,45 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      const step2Body = new URLSearchParams({
-        __RequestVerificationToken: session.form_token ?? "",
-        LoginID: session.login_id,
+      const loginResp = await xyApi("/api/Token/Login", {
+        LoginId: session.login_id,
         Password: password,
-        CaptchaDeText: session.captcha_de_text ?? "",
-        CaptchaInputText: "",
-      }).toString();
-      const loginResp = await fetchWithCookies(XY_BASE + "/Account/LoginVerify", session.cookies, {
-        method: "POST",
-        body: step2Body,
-        headers: {
-          "X-Requested-With": "XMLHttpRequest",
-          "Content-Type": "application/x-www-form-urlencoded",
-          Referer: XY_BASE + "/Login",
-        },
-      });
-      const isRedirect = loginResp.status >= 300 && loginResp.status < 400;
-      const hasError = /field-validation-error|验证码错误|帐号或密码|账号或密码|登录失败|登入失败|密码错误/i.test(loginResp.text);
-      let finalCookies = loginResp.cookies;
-      if (isRedirect && !hasError) {
-        let currentResp = loginResp;
-        for (let i = 0; i < 8; i++) {
-          if (currentResp.status < 300 || currentResp.status >= 400) break;
-          const location = currentResp.headers.get("location");
-          if (!location) break;
-          const redirectUrl = location.startsWith("http") ? location : XY_BASE + (location.startsWith("/") ? location : "/" + location);
-          currentResp = await fetchWithCookies(redirectUrl, currentResp.cookies, { redirect: "manual" });
-          finalCookies = currentResp.cookies;
-        }
-        const verifyResp = await fetchWithCookies(XY_BASE + "/Bet/128", finalCookies, { redirect: "manual" });
-        finalCookies = verifyResp.cookies;
-        const stillTimeout = /ErrorHandle\/Timeout|top\.location\.href/.test(verifyResp.text);
-        if (stillTimeout) {
-          return new Response(
-            JSON.stringify({ success: false, error: "登录后仍无法访问星亿娱乐页面，请重试" }),
-            { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
-        }
+        GraphicsCaptcha: { Code: session.captcha_code ?? "", Data: session.captcha_de_text ?? "" },
+        GooglePassword: "",
+      }, session.cookies ?? "");
+
+      const graphicsResult = loginResp.data.GraphicsResult as number | undefined;
+      if (graphicsResult !== undefined && graphicsResult !== 0) {
+        return new Response(
+          JSON.stringify({ success: false, error: "验证码已过期，请刷新验证码后重试" }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
-      if (isRedirect && !hasError) {
-        sessions.set(sessionId, { ...session, cookies: finalCookies, authenticated: true });
+      const result = loginResp.data.Result as number | undefined;
+      if (result === 0) {
+        const token = (loginResp.data.Token as string) || "";
+        sessions.set(sessionId, { ...session, cookies: loginResp.cookies, login_token: token, authenticated: true });
         return new Response(
           JSON.stringify({ success: true, sessionId }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
-      } else {
-        let errorMsg = "登录失败，请检查密码";
-        if (/密码错误/i.test(loginResp.text)) errorMsg = "密码错误";
-        return new Response(
-          JSON.stringify({ success: false, error: errorMsg }),
-          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
       }
+      const errorMap: Record<number, string> = {
+        1: "帐号已停用",
+        2: "Token错误",
+        3: "请修改默认密码",
+        6: "帐号或密码错误",
+        7: "短信验证码错误",
+        8: "需要Google验证码",
+        9: "Google验证码错误",
+        15: "帐号已锁定",
+        16: "密码过于简单，请修改密码",
+      };
+      const errorMsg = (result !== undefined && errorMap[result]) || "登录失败，请检查密码";
+      return new Response(
+        JSON.stringify({ success: false, error: errorMsg }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
     if (action === "xybet") {
