@@ -1007,6 +1007,264 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       );
     }
 
+    // ── 星亿娱乐 (xybet) platform ──
+
+    if (action === "xycaptcha") {
+      const XY_BASE = "https://s.xybet00.com";
+      const home = await fetchWithCookies(XY_BASE + "/", "", { redirect: "follow" });
+      const formToken = getFormField(home.text, "__RequestVerificationToken");
+      const captchaFrag = await fetchWithCookies(
+        XY_BASE + "/Account/Captcha",
+        home.cookies,
+        {
+          method: "POST",
+          body: "CaptchaError=False",
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+            Referer: XY_BASE + "/",
+          },
+        }
+      );
+      const captchaDeText = getFormField(captchaFrag.text, "CaptchaDeText");
+      if (!captchaDeText) {
+        return new Response(
+          JSON.stringify({ error: "无法获取星亿娱乐验证码令牌" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const captchaImgResp = await lotteryFetch(
+        XY_BASE + "/DefaultCaptcha/Generate?t=" + captchaDeText,
+        {
+          headers: {
+            "User-Agent": UA,
+            Cookie: captchaFrag.cookies,
+            Referer: XY_BASE + "/",
+          },
+        }
+      );
+      if (!captchaImgResp.ok) {
+        return new Response(
+          JSON.stringify({ error: `获取星亿娱乐验证码图片失败 (${captchaImgResp.status})` }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const imgBuffer = await captchaImgResp.arrayBuffer();
+      const imgBytes = new Uint8Array(imgBuffer);
+      let imgBase64: string;
+      if (typeof Buffer !== "undefined") {
+        imgBase64 = Buffer.from(imgBuffer).toString("base64");
+      } else {
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < imgBytes.length; i += chunk) {
+          binary += String.fromCharCode(...imgBytes.subarray(i, i + chunk));
+        }
+        imgBase64 = btoa(binary);
+      }
+      const contentType = captchaImgResp.headers.get("content-type")?.split(";")[0].trim() || "image/gif";
+      const xySessionId = crypto.randomUUID();
+      sessions.set(xySessionId, {
+        id: xySessionId,
+        cookies: captchaFrag.cookies,
+        form_token: formToken,
+        captcha_de_text: captchaDeText,
+        authenticated: false,
+      });
+      return new Response(
+        JSON.stringify({ sessionId: xySessionId, captchaImage: `data:${contentType};base64,${imgBase64}` }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "xylogin") {
+      const XY_BASE = "https://s.xybet00.com";
+      const body = await req.json();
+      const { sessionId, loginId, password, captchaInput } = body as {
+        sessionId: string; loginId: string; password: string; captchaInput: string;
+      };
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话已过期，请刷新验证码" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const loginBody = new URLSearchParams({
+        __RequestVerificationToken: session.form_token ?? "",
+        LoginID: loginId,
+        Password: password,
+        CaptchaDeText: session.captcha_de_text ?? "",
+        CaptchaInputText: captchaInput,
+      }).toString();
+      const loginResp = await fetchWithCookies(XY_BASE + "/Account/LoginVerify", session.cookies, {
+        method: "POST",
+        body: loginBody,
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          "Content-Type": "application/x-www-form-urlencoded",
+          Referer: XY_BASE + "/",
+        },
+      });
+      const isRedirect = loginResp.status >= 300 && loginResp.status < 400;
+      const hasError = /field-validation-error|验证码错误|帐号或密码|账号或密码|登录失败|登入失败|密码错误/i.test(loginResp.text);
+      let finalCookies = loginResp.cookies;
+      if (isRedirect && !hasError) {
+        let currentResp = loginResp;
+        for (let i = 0; i < 8; i++) {
+          if (currentResp.status < 300 || currentResp.status >= 400) break;
+          const location = currentResp.headers.get("location");
+          if (!location) break;
+          const redirectUrl = location.startsWith("http") ? location : XY_BASE + (location.startsWith("/") ? location : "/" + location);
+          currentResp = await fetchWithCookies(redirectUrl, currentResp.cookies, { redirect: "manual" });
+          finalCookies = currentResp.cookies;
+        }
+        const verifyResp = await fetchWithCookies(XY_BASE + "/Bet/128", finalCookies, { redirect: "manual" });
+        finalCookies = verifyResp.cookies;
+        const stillTimeout = /ErrorHandle\/Timeout|top\.location\.href/.test(verifyResp.text);
+        if (stillTimeout) {
+          return new Response(
+            JSON.stringify({ success: false, error: "登录后仍无法访问星亿娱乐页面，请重试" }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      }
+      if (isRedirect && !hasError) {
+        sessions.set(sessionId, { ...session, cookies: finalCookies, authenticated: true });
+        return new Response(
+          JSON.stringify({ success: true, sessionId }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      } else {
+        let errorMsg = "星亿娱乐登录失败，请检查账号密码和验证码";
+        if (/验证码/i.test(loginResp.text)) errorMsg = "验证码错误";
+        else if (/帐号或密码|账号或密码|密码错误/i.test(loginResp.text)) errorMsg = "账号或密码错误";
+        return new Response(
+          JSON.stringify({ success: false, error: errorMsg }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    if (action === "xybet") {
+      const XY_BASE = "https://s.xybet00.com";
+      const body = await req.json();
+      const { sessionId, lotteryId, issue, picks, betAmount, position } = body as {
+        sessionId: string; lotteryId: number; issue: string; picks: number[]; betAmount: number; position?: number;
+      };
+      const betPosition = position >= 1 && position <= 5 ? Math.round(position) : 5;
+      const numberParts = ["", "", "", "", ""];
+      numberParts[betPosition - 1] = "{pos}";
+
+      if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
+        return new Response(
+          JSON.stringify({ error: "参数不完整" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话已过期，请重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const cookies = session.cookies;
+      const betPageUrl = XY_BASE + "/Bet/Index?gid=" + lotteryId;
+      let betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
+      let betPageCookies = betPageResp.cookies;
+      let betPageHtml = betPageResp.text;
+      for (let i = 0; i < 8; i++) {
+        if (betPageResp.status < 300 || betPageResp.status >= 400) break;
+        const location = betPageResp.headers.get("location");
+        if (!location) break;
+        const redirectUrl = location.startsWith("http") ? location : XY_BASE + (location.startsWith("/") ? location : "/" + location);
+        const next = await fetchWithCookies(redirectUrl, betPageCookies, { redirect: "manual" });
+        betPageCookies = next.cookies;
+        betPageHtml = next.text;
+        betPageResp = next;
+        break;
+      }
+      const isBetPageLogin = /ErrorHandle\/Timeout|top\.location\.href/i.test(betPageHtml);
+      if (isBetPageLogin) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const betFormToken = getFormField(betPageHtml, "__RequestVerificationToken");
+      const realGameId = lotteryId;
+      const gameInfoResp = await fetchWithCookies(XY_BASE + "/Bet/GameInfo", betPageCookies, {
+        method: "POST",
+        body: "lotteryGameId=" + realGameId,
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest", Referer: betPageUrl },
+      });
+      betPageCookies = gameInfoResp.cookies;
+      const betParamsResp = await fetchWithCookies(XY_BASE + "/Bet/GetBetParameters", betPageCookies, {
+        method: "POST",
+        body: "gameURLID=" + lotteryId,
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest", Referer: betPageUrl },
+      });
+      betPageCookies = betParamsResp.cookies;
+      sessions.set(sessionId, { ...session, cookies: betPageCookies });
+
+      const serialNumber = issue.replace("-", "");
+      const guid = generateBetGuid();
+      const unit = 2;
+      const multiple = Math.max(1, Math.round(betAmount / unit));
+      const betData = {
+        LotteryGameID: realGameId,
+        SerialNumber: serialNumber,
+        Bets: picks.map((n) => ({
+          BetTypeCode: 21, BetTypeName: "",
+          Number: numberParts.join(",").replace("{pos}", String(n)),
+          Position: String(betPosition),
+          Unit: unit, Multiple: multiple, ReturnRate: 0, IsCompressed: false, NoCommission: false,
+        })),
+        Schedules: [], StopIfWin: false, BetMode: 0, Guid: guid, IsLoginByWeChat: false,
+      };
+      const betResp = await fetchWithCookies(XY_BASE + "/Bet/Confirm?tgid=" + guid, betPageCookies, {
+        method: "POST",
+        body: JSON.stringify(betData),
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: betPageUrl,
+          ...(betFormToken ? { "__RequestVerificationToken": betFormToken } : {}),
+        },
+      });
+      const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
+      if (isLoginRedirect) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      let betResult: unknown;
+      try { betResult = JSON.parse(betResp.text); } catch { betResult = { raw: betResp.text.slice(0, 500) }; }
+      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
+      if (hasError) {
+        return new Response(
+          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const betId = crypto.randomUUID();
+      const totalCost = betAmount * picks.length;
+      const bet: BetRow = {
+        id: betId, session_id: sessionId, lottery_id: lotteryId, issue, picks,
+        bet_amount: betAmount, total_cost: totalCost, status: "pending",
+        result_number: null, payout: 0, net: 0, position: betPosition,
+        created_at: new Date().toISOString(), settled_at: null,
+      };
+      if (!bets.has(sessionId)) bets.set(sessionId, []);
+      bets.get(sessionId)!.push(bet);
+      return new Response(
+        JSON.stringify({ success: true, betId, betResult }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     return new Response(
       JSON.stringify({ error: "Unknown action: " + action }),
       {

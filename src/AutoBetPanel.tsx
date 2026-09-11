@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Zap, Loader2, Trash2, TrendingUp, TrendingDown } from 'lucide-react';
+import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff } from 'lucide-react';
 import { API_URL, API_HEADERS } from '@/api';
 import { NumberBall, ballColor } from '@/App';
 
@@ -20,6 +20,8 @@ export interface BetRow {
   position: number;
 }
 
+export type BetPlatform = 'aoshi' | 'xingyi';
+
 interface AutoBetPanelProps {
   sessionId: string;
   gameId: number;
@@ -33,6 +35,11 @@ interface AutoBetPanelProps {
   positionLabel: string;
   onPlaceBet: () => void;
   placingBet: boolean;
+  platform: BetPlatform;
+  onPlatformChange: (platform: BetPlatform) => void;
+  xySessionId: string | null;
+  onXyLoginSuccess: (sessionId: string) => void;
+  onXyLogout: () => void;
 }
 
 export function AutoBetPanel({
@@ -48,9 +55,15 @@ export function AutoBetPanel({
   positionLabel,
   onPlaceBet,
   placingBet,
+  platform,
+  onPlatformChange,
+  xySessionId,
+  onXyLoginSuccess,
+  onXyLogout,
 }: AutoBetPanelProps) {
   const [bets, setBets] = useState<BetRow[]>([]);
   const [loadingBets, setLoadingBets] = useState(false);
+  const [showXyLogin, setShowXyLogin] = useState(false);
 
   const fetchBets = useCallback(async () => {
     if (!sessionId) return;
@@ -105,6 +118,23 @@ export function AutoBetPanel({
     ? `${Math.round((wonBets.length / (wonBets.length + lostBets.length)) * 100)}%`
     : '—';
 
+  const needsXyLogin = platform === 'xingyi' && !xySessionId;
+
+  const handlePlatformChange = (next: BetPlatform) => {
+    onPlatformChange(next);
+    if (next === 'xingyi' && !xySessionId) {
+      setShowXyLogin(true);
+    }
+  };
+
+  const handlePlaceBet = () => {
+    if (platform === 'xingyi' && !xySessionId) {
+      setShowXyLogin(true);
+      return;
+    }
+    onPlaceBet();
+  };
+
   return (
     <div className="space-y-6">
       {/* Control panel */}
@@ -112,6 +142,60 @@ export function AutoBetPanel({
         <div className="mb-5 flex items-center gap-2">
           <Zap className="h-5 w-5 text-amber-500" />
           <h3 className="text-lg font-semibold text-slate-800">自动投注设置</h3>
+        </div>
+
+        {/* Platform selector */}
+        <div className="mb-5">
+          <label className="mb-2 block text-sm font-medium text-slate-600">投注平台</label>
+          <div className="flex flex-wrap gap-3">
+            <button
+              onClick={() => handlePlatformChange('aoshi')}
+              className={`flex items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium transition ${
+                platform === 'aoshi'
+                  ? 'border-sky-400 bg-sky-50 text-sky-700 shadow-sm'
+                  : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+              }`}
+            >
+              <span className={`h-2.5 w-2.5 rounded-full ${platform === 'aoshi' ? 'bg-sky-500' : 'bg-slate-300'}`} />
+              傲世皇朝
+            </button>
+            <button
+              onClick={() => handlePlatformChange('xingyi')}
+              className={`flex items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium transition ${
+                platform === 'xingyi'
+                  ? 'border-emerald-400 bg-emerald-50 text-emerald-700 shadow-sm'
+                  : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+              }`}
+            >
+              <span className={`h-2.5 w-2.5 rounded-full ${platform === 'xingyi' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+              星亿娱乐
+            </button>
+          </div>
+          {platform === 'xingyi' && (
+            <div className="mt-3 flex items-center gap-3">
+              {xySessionId ? (
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-100 px-3 py-1.5 text-xs font-medium text-emerald-700">
+                    <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                    星亿娱乐已登录
+                  </span>
+                  <button
+                    onClick={onXyLogout}
+                    className="text-xs text-slate-500 hover:text-rose-500"
+                  >
+                    退出登录
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowXyLogin(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-600"
+                >
+                  登录星亿娱乐
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
@@ -150,7 +234,7 @@ export function AutoBetPanel({
           </div>
 
           <button
-            onClick={onPlaceBet}
+            onClick={handlePlaceBet}
             disabled={placingBet || !nextIssue || nextPicks.length === 0}
             className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:from-amber-600 hover:to-orange-600 disabled:opacity-50"
           >
@@ -163,8 +247,15 @@ export function AutoBetPanel({
           </button>
         </div>
 
+        {needsXyLogin && autoBetOn && (
+          <div className="mt-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+            <AlertCircle className="h-4 w-4 flex-shrink-0" />
+            <span>请先登录星亿娱乐，才能进行自动投注</span>
+          </div>
+        )}
+
         {/* Next bet preview */}
-        {autoBetOn && nextIssue && nextPicks.length > 0 && (
+        {autoBetOn && nextIssue && nextPicks.length > 0 && !(platform === 'xingyi' && !xySessionId) && (
           <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
@@ -173,6 +264,7 @@ export function AutoBetPanel({
                 </p>
                 <p className="mt-1 text-xs text-amber-600">
                   {nextPicks.length} 码 · 每码 ¥{betAmount} · 共需 ¥{betAmount * nextPicks.length}
+                  {platform === 'xingyi' ? ' · 星亿娱乐' : ' · 傲世皇朝'}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -316,6 +408,221 @@ export function AutoBetPanel({
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* 星亿娱乐 login modal */}
+      {showXyLogin && (
+        <XyLoginModal
+          onClose={() => setShowXyLogin(false)}
+          onSuccess={(sid) => {
+            onXyLoginSuccess(sid);
+            setShowXyLogin(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── 星亿娱乐 login modal ──
+
+interface XyLoginModalProps {
+  onClose: () => void;
+  onSuccess: (sessionId: string) => void;
+}
+
+function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
+  const [loginId, setLoginId] = useState('');
+  const [password, setPassword] = useState('');
+  const [captchaInput, setCaptchaInput] = useState('');
+  const [captchaImage, setCaptchaImage] = useState('');
+  const [sessionId, setSessionId] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadingCaptcha, setLoadingCaptcha] = useState(false);
+  const [error, setError] = useState('');
+  const [imgError, setImgError] = useState(false);
+
+  const fetchCaptcha = useCallback(async () => {
+    setLoadingCaptcha(true);
+    setError('');
+    setCaptchaInput('');
+    setImgError(false);
+    try {
+      const resp = await fetch(`${API_URL}?action=xycaptcha`, { headers: API_HEADERS });
+      const data = (await resp.json().catch(() => ({}))) as {
+        error?: string; captchaImage?: string; sessionId?: string;
+      };
+      if (!resp.ok || data.error || !data.captchaImage || !data.sessionId) {
+        throw new Error(data.error || `获取验证码失败 (${resp.status})`);
+      }
+      setCaptchaImage(data.captchaImage);
+      setSessionId(data.sessionId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '获取星亿娱乐验证码失败');
+    } finally {
+      setLoadingCaptcha(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchCaptcha();
+  }, [fetchCaptcha]);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginId.trim() || !password.trim() || !captchaInput.trim()) {
+      setError('请填写所有栏位');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const resp = await fetch(`${API_URL}?action=xylogin`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({
+          sessionId,
+          loginId: loginId.trim(),
+          password: password.trim(),
+          captchaInput: captchaInput.trim(),
+        }),
+      });
+      const data = await resp.json();
+      if (data.success) {
+        onSuccess(data.sessionId);
+      } else {
+        setError(data.error || '星亿娱乐登录失败');
+        fetchCaptcha();
+      }
+    } catch {
+      setError('网络错误，请重试');
+      fetchCaptcha();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="relative w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 shadow-2xl">
+        <button
+          onClick={onClose}
+          className="absolute right-4 top-4 text-slate-400 transition hover:text-slate-600"
+        >
+          <X className="h-5 w-5" />
+        </button>
+
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-500 shadow-lg">
+            <ShieldCheck className="h-7 w-7 text-white" />
+          </div>
+          <h2 className="text-xl font-bold text-slate-800">登录星亿娱乐</h2>
+          <p className="mt-1 text-sm text-slate-500">登录后可对星亿娱乐进行自动投注</p>
+        </div>
+
+        {error && (
+          <div className="mb-5 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600">
+            <AlertCircle className="h-4 w-4 flex-shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <form onSubmit={handleLogin} className="space-y-5">
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-600">帐号</label>
+            <div className="relative">
+              <User className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={loginId}
+                onChange={(e) => setLoginId(e.target.value)}
+                placeholder="请输入星亿娱乐帐号"
+                autoComplete="username"
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-600">密码</label>
+            <div className="relative">
+              <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+              <input
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="请输入密码"
+                autoComplete="current-password"
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-11 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-600">验证码</label>
+            <div className="flex gap-3">
+              <div className="relative flex-1">
+                <ShieldCheck className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={captchaInput}
+                  onChange={(e) => setCaptchaInput(e.target.value)}
+                  placeholder="请输入验证码"
+                  maxLength={6}
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-slate-800 placeholder-slate-400 outline-none transition focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={fetchCaptcha}
+                disabled={loadingCaptcha}
+                className="relative h-[46px] w-32 flex-shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 transition hover:border-emerald-300 disabled:opacity-50"
+                title="点击刷新验证码"
+              >
+                {loadingCaptcha ? (
+                  <div className="flex h-full items-center justify-center">
+                    <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+                  </div>
+                ) : captchaImage && !imgError ? (
+                  <img
+                    src={captchaImage}
+                    alt="验证码"
+                    className="h-full w-full object-cover"
+                    onError={() => {
+                      setImgError(true);
+                      setError('验证码图片加载失败，正在重试…');
+                      setTimeout(() => fetchCaptcha(), 1500);
+                    }}
+                  />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-slate-400">
+                    <RefreshCw className="h-5 w-5" />
+                  </div>
+                )}
+              </button>
+            </div>
+          </div>
+          <button
+            type="submit"
+            disabled={loading || loadingCaptcha}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 py-3 font-semibold text-white shadow-lg shadow-emerald-500/20 transition hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="h-5 w-5 animate-spin" />
+                登录中…
+              </>
+            ) : (
+              '登录星亿娱乐'
+            )}
+          </button>
+        </form>
       </div>
     </div>
   );

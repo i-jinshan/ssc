@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { LoginScreen } from '@/LoginScreen';
 import { AutoBetPanel } from '@/AutoBetPanel';
+import type { BetPlatform } from '@/AutoBetPanel';
 import { API_URL, API_HEADERS } from '@/api';
 import type { DrawResult } from '@/lotteryData';
 
@@ -44,6 +45,8 @@ const DEFAULT_MARTINGALE_RESET = 3;
 const AUTO_BET_ON_KEY = 'lottery-auto-bet-on';
 const BET_AMOUNT_KEY = 'lottery-bet-amount';
 const DEFAULT_BET_AMOUNT = 100;
+const BET_PLATFORM_KEY = 'lottery-bet-platform';
+const XY_SESSION_KEY = 'lottery-xy-session-id';
 
 type GameId = 60 | 127 | 128;
 type Position = 1 | 2 | 3 | 4 | 5;
@@ -1098,6 +1101,12 @@ function App() {
   const [betAmount, setBetAmount] = useState(readStoredBetAmount);
   const [placingBet, setPlacingBet] = useState(false);
   const [lastBetIssue, setLastBetIssue] = useState<string | null>(null);
+  const [platform, setPlatform] = useState<BetPlatform>(() => {
+    try { return (localStorage.getItem(BET_PLATFORM_KEY) as BetPlatform) || 'aoshi'; } catch { return 'aoshi'; }
+  });
+  const [xySessionId, setXySessionId] = useState<string | null>(() => {
+    try { return localStorage.getItem(XY_SESSION_KEY); } catch { return null; }
+  });
   const gameIdRef = useRef(gameId);
   gameIdRef.current = gameId;
 
@@ -1162,13 +1171,16 @@ function App() {
 
   const placeBet = useCallback(async (issue: string, picks: number[]) => {
     if (!sessionId || !issue || picks.length === 0) return;
+    if (platform === 'xingyi' && !xySessionId) return;
     setPlacingBet(true);
     try {
-      const resp = await fetch(`${API_URL}?action=bet`, {
+      const action = platform === 'xingyi' ? 'xybet' : 'bet';
+      const useSessionId = platform === 'xingyi' ? xySessionId : sessionId;
+      const resp = await fetch(`${API_URL}?action=${action}`, {
         method: 'POST',
         headers: API_HEADERS,
         body: JSON.stringify({
-          sessionId,
+          sessionId: useSessionId,
           lotteryId: gameId,
           issue,
           picks,
@@ -1192,7 +1204,7 @@ function App() {
     } finally {
       setPlacingBet(false);
     }
-  }, [sessionId, gameId, betAmount, position]);
+  }, [sessionId, gameId, betAmount, position, platform, xySessionId]);
 
   const applyGame = useCallback((next: GameId) => {
     persistGame(next);
@@ -1216,12 +1228,13 @@ function App() {
 
   useEffect(() => {
     if (!autoBetOn || !sessionId || draws.length === 0 || !recommendation.hasEnough) return;
+    if (platform === 'xingyi' && !xySessionId) return;
     const targetIssue = nextIssue(draws[0]?.issue ?? '');
     if (!targetIssue || targetIssue === lastBetIssue) return;
     const picks = recommendation.nextPicks;
     if (picks.length === 0) return;
     placeBet(targetIssue, picks);
-  }, [autoBetOn, sessionId, draws, recommendation, lastBetIssue, placeBet]);
+  }, [autoBetOn, sessionId, draws, recommendation, lastBetIssue, placeBet, platform, xySessionId]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
@@ -1690,6 +1703,20 @@ function App() {
                     }
                   }}
                   placingBet={placingBet}
+                  platform={platform}
+                  onPlatformChange={(next) => {
+                    try { localStorage.setItem(BET_PLATFORM_KEY, next); } catch { /* ignore */ }
+                    setPlatform(next);
+                  }}
+                  xySessionId={xySessionId}
+                  onXyLoginSuccess={(sid) => {
+                    try { localStorage.setItem(XY_SESSION_KEY, sid); } catch { /* ignore */ }
+                    setXySessionId(sid);
+                  }}
+                  onXyLogout={() => {
+                    try { localStorage.removeItem(XY_SESSION_KEY); } catch { /* ignore */ }
+                    setXySessionId(null);
+                  }}
                 />
               )}
             </div>
