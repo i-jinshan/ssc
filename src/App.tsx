@@ -546,7 +546,7 @@ function DataTable({
                           <span
                             key={i}
                             className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold ring-1 ${
-                              n === ge
+                              n === digit
                                 ? 'bg-emerald-500 text-white ring-emerald-600'
                                 : 'bg-slate-100 text-slate-600 ring-slate-200'
                             }`}
