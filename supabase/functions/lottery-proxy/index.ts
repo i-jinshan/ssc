@@ -1164,6 +1164,24 @@ Deno.serve(async (req: Request) => {
 
     const XY_BASE = "https://s.xybet00.com";
 
+    async function xyAuthCookies(): Promise<string> {
+      // XY requires auth cookies (token + random) from the /auth redirect chain.
+      // GET / → 307 → /auth?url=/ → 307 with Set-Cookie: token=xxx; random=xxx
+      const r1 = await fetch(XY_BASE + "/", {
+        headers: { "User-Agent": UA },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      const loc1 = r1.headers.get("location") || "/auth?url=%2F";
+      const authUrl = loc1.startsWith("http") ? loc1 : XY_BASE + loc1;
+      const r2 = await fetch(authUrl, {
+        headers: { "User-Agent": UA, Cookie: parseSetCookie(r1.headers) },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      return mergeCookies(parseSetCookie(r1.headers), parseSetCookie(r2.headers));
+    }
+
     async function xyApi(path: string, body: unknown, cookieStr: string): Promise<{ data: Record<string, unknown>; cookies: string; status: number }> {
       const resp = await fetch(XY_BASE + path, {
         method: "POST",
@@ -1175,6 +1193,7 @@ Deno.serve(async (req: Request) => {
           ...(cookieStr ? { Cookie: cookieStr } : {}),
         },
         body: JSON.stringify(body),
+        redirect: "manual",
         signal: AbortSignal.timeout(15000),
       });
       const newCookies = parseSetCookie(resp.headers);
@@ -1186,7 +1205,8 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "xycaptcha") {
-      const captchaResp = await xyApi("/api/GraphicsCaptcha/Create", {}, "");
+      const authCookies = await xyAuthCookies();
+      const captchaResp = await xyApi("/api/GraphicsCaptcha/Create", {}, authCookies);
       const img = captchaResp.data.ImageBase64Str as string | undefined;
       const captchaData = captchaResp.data.Data as string | undefined;
       if (!img || !captchaData) {

@@ -1018,6 +1018,22 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     const XY_BASE = "https://s.xybet00.com";
 
+    async function xyAuthCookies(): Promise<string> {
+      const r1 = await lotteryFetch(XY_BASE + "/", {
+        headers: { "User-Agent": UA },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      const loc1 = r1.headers.get("location") || "/auth?url=%2F";
+      const authUrl = loc1.startsWith("http") ? loc1 : XY_BASE + loc1;
+      const r2 = await lotteryFetch(authUrl, {
+        headers: { "User-Agent": UA, Cookie: parseSetCookie(r1.headers) },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      return mergeCookies(parseSetCookie(r1.headers), parseSetCookie(r2.headers));
+    }
+
     async function xyApi(path: string, body: unknown, cookieStr: string): Promise<{ data: Record<string, unknown>; cookies: string; status: number }> {
       const resp = await lotteryFetch(XY_BASE + path, {
         method: "POST",
@@ -1029,6 +1045,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           ...(cookieStr ? { Cookie: cookieStr } : {}),
         },
         body: JSON.stringify(body),
+        redirect: "manual",
         signal: AbortSignal.timeout(15000),
       });
       const newCookies = parseSetCookie(resp.headers);
@@ -1040,7 +1057,8 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     }
 
     if (action === "xycaptcha") {
-      const captchaResp = await xyApi("/api/GraphicsCaptcha/Create", {}, "");
+      const authCookies = await xyAuthCookies();
+      const captchaResp = await xyApi("/api/GraphicsCaptcha/Create", {}, authCookies);
       const img = captchaResp.data.ImageBase64Str as string | undefined;
       const captchaData = captchaResp.data.Data as string | undefined;
       if (!img || !captchaData) {
