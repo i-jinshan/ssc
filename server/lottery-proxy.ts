@@ -170,7 +170,7 @@ async function fetchWithCookies(
   const reqHeaders: Record<string, string> = {
     "User-Agent": UA,
     Cookie: cookieStr,
-    Referer: LOTTERY_BASE + "/",
+    Referer: new URL(url).origin + "/",
     ...options.headers,
   };
   if (options.body && !reqHeaders["Content-Type"]) {

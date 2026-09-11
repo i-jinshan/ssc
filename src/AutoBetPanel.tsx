@@ -451,7 +451,10 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
     setCaptchaInput('');
     setImgError(false);
     try {
-      const resp = await fetch(`${API_URL}?action=xycaptcha`, { headers: API_HEADERS });
+      const resp = await fetch(`${API_URL}?action=xycaptcha`, {
+        headers: API_HEADERS,
+        signal: AbortSignal.timeout(20000),
+      });
       const data = (await resp.json().catch(() => ({}))) as {
         error?: string; captchaImage?: string; sessionId?: string;
       };
@@ -461,7 +464,10 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
       setCaptchaImage(data.captchaImage);
       setSessionId(data.sessionId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '获取星亿娱乐验证码失败');
+      const msg = err instanceof Error
+        ? (err.name === 'TimeoutError' ? '获取验证码超时，请重试' : err.message)
+        : '获取星亿娱乐验证码失败';
+      setError(msg);
     } finally {
       setLoadingCaptcha(false);
     }

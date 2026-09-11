@@ -94,7 +94,7 @@ async function fetchWithCookies(
   const reqHeaders: Record<string, string> = {
     "User-Agent": UA,
     Cookie: cookieStr,
-    Referer: LOTTERY_BASE + "/",
+    Referer: new URL(url).origin + "/",
     ...options.headers,
   };
   if (options.body && !reqHeaders["Content-Type"]) {
@@ -106,6 +106,7 @@ async function fetchWithCookies(
     headers: reqHeaders,
     body: options.body,
     redirect: options.redirect ?? "manual",
+    signal: AbortSignal.timeout(15000),
   });
 
   const newCookies = parseSetCookie(resp.headers);
@@ -1183,7 +1184,7 @@ Deno.serve(async (req: Request) => {
       }
       const captchaImgResp = await fetch(
         XY_BASE + "/DefaultCaptcha/Generate?t=" + captchaDeText,
-        { headers: { "User-Agent": UA, Cookie: captchaFrag.cookies, Referer: XY_BASE + "/" } }
+        { headers: { "User-Agent": UA, Cookie: captchaFrag.cookies, Referer: XY_BASE + "/" }, signal: AbortSignal.timeout(15000) }
       );
       if (!captchaImgResp.ok) {
         return new Response(
