@@ -780,13 +780,18 @@ Deno.serve(async (req: Request) => {
 
     if (action === "bet") {
       const body = await req.json();
-      const { sessionId, lotteryId, issue, picks, betAmount } = body as {
+      const { sessionId, lotteryId, issue, picks, betAmount, position } = body as {
         sessionId: string;
         lotteryId: number;
         issue: string;
         picks: number[];
         betAmount: number;
+        position?: number;
       };
+
+      const betPosition = position >= 1 && position <= 5 ? Math.round(position) : 5;
+      const numberParts = ["", "", "", "", ""];
+      numberParts[betPosition - 1] = "{pos}";
 
       if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
         return new Response(
@@ -903,8 +908,8 @@ Deno.serve(async (req: Request) => {
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
           BetTypeName: "",
-          Number: ",,,," + String(n),
-          Position: "5",
+          Number: numberParts.join(",").replace("{pos}", String(n)),
+          Position: String(betPosition),
           Unit: unit,
           Multiple: multiple,
           ReturnRate: 0,
@@ -1027,6 +1032,7 @@ Deno.serve(async (req: Request) => {
           bet_amount: betAmount,
           total_cost: totalCost,
           status: "pending",
+          position: betPosition,
         })
         .select("id")
         .single();
@@ -1090,7 +1096,7 @@ Deno.serve(async (req: Request) => {
       let settledCount = 0;
 
       for (const draw of draws) {
-        const resultNumber = draw.numbers[4];
+        const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
         const issueKey = draw.issue.includes("-")
           ? draw.issue
           : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);

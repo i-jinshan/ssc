@@ -33,6 +33,7 @@ const MARTINGALE_ON_KEY = 'lottery-martingale-on';
 const MARTINGALE_FACTOR_KEY = 'lottery-martingale-factor';
 const MARTINGALE_RESET_KEY = 'lottery-martingale-reset';
 const GAME_KEY = 'lottery-game-id';
+const POSITION_KEY = 'lottery-position';
 const DRAWS_KEY_LEGACY = 'lottery-draws';
 const MARTINGALE_FACTOR_MIN = 1.01;
 const MARTINGALE_FACTOR_MAX = 10;
@@ -45,6 +46,15 @@ const BET_AMOUNT_KEY = 'lottery-bet-amount';
 const DEFAULT_BET_AMOUNT = 100;
 
 type GameId = 60 | 127 | 128;
+type Position = 1 | 2 | 3 | 4 | 5;
+
+const POSITION_OPTIONS: { value: Position; label: string }[] = [
+  { value: 1, label: '万位' },
+  { value: 2, label: '千位' },
+  { value: 3, label: '百位' },
+  { value: 4, label: '十位' },
+  { value: 5, label: '个位' },
+];
 
 const GAMES: { id: GameId; label: string }[] = [
   { id: 128, label: '腾讯10分彩' },
@@ -80,6 +90,27 @@ function persistGame(gameId: GameId) {
 
 function gameLabel(gameId: GameId): string {
   return GAMES.find((g) => g.id === gameId)?.label ?? '腾讯10分彩';
+}
+
+function readStoredPosition(): Position {
+  try {
+    const parsed = Number.parseInt(localStorage.getItem(POSITION_KEY) ?? '', 10);
+    return parsed >= 1 && parsed <= 5 ? (parsed as Position) : 5;
+  } catch {
+    return 5;
+  }
+}
+
+function persistPosition(position: Position) {
+  try {
+    localStorage.setItem(POSITION_KEY, String(position));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function positionLabel(position: Position): string {
+  return POSITION_OPTIONS.find((option) => option.value === position)?.label ?? '个位';
 }
 
 function persistSession(id: string | null) {
@@ -366,19 +397,20 @@ type RecResult = { picks: number[]; hit: boolean; eligible: boolean };
 function computePicksFromHistory(
   history: DrawResult[],
   pickCount: number,
-  excludeLast: boolean
+  excludeLast: boolean,
+  position: Position
 ): number[] {
   const geCounts = new Array(10).fill(0);
   const transition: number[][] = Array.from({ length: 10 }, () => new Array(10).fill(0));
   let prevGe = -1;
 
   for (const draw of history) {
-    const ge = draw.numbers[4];
-    geCounts[ge]++;
+    const digit = draw.numbers[position - 1];
+    geCounts[digit]++;
     if (prevGe >= 0) {
-      transition[prevGe][ge]++;
+      transition[prevGe][digit]++;
     }
-    prevGe = ge;
+    prevGe = digit;
   }
 
   const maxHot = Math.max(...geCounts) || 1;
@@ -408,7 +440,8 @@ function buildRecommendations(
   data: DrawResult[],
   windowSize: number,
   pickCount: number,
-  excludeLast: boolean
+  excludeLast: boolean,
+  position: Position
 ): { recs: Map<string, RecResult>; nextPicks: number[]; hasEnough: boolean; evaluatedCount: number } {
   const recs = new Map<string, RecResult>();
   const oldestFirst = [...data].sort((a, b) => a.issue.localeCompare(b.issue));
@@ -427,12 +460,12 @@ function buildRecommendations(
       continue;
     }
     const history = oldestFirst.slice(i - windowSize, i);
-    const picks = computePicksFromHistory(history, pickCount, excludeLast);
-    const ge = oldestFirst[i].numbers[4];
-    recs.set(oldestFirst[i].issue, { picks, hit: picks.includes(ge), eligible: true });
+    const picks = computePicksFromHistory(history, pickCount, excludeLast, position);
+    const digit = oldestFirst[i].numbers[position - 1];
+    recs.set(oldestFirst[i].issue, { picks, hit: picks.includes(digit), eligible: true });
   }
 
-  const nextPicks = computePicksFromHistory(oldestFirst.slice(-windowSize), pickCount, excludeLast);
+  const nextPicks = computePicksFromHistory(oldestFirst.slice(-windowSize), pickCount, excludeLast, position);
   return {
     recs,
     nextPicks,
@@ -469,10 +502,12 @@ function DataTable({
   data,
   recs,
   pickCount,
+  position,
 }: {
   data: DrawResult[];
   recs: Map<string, RecResult>;
   pickCount: number;
+  position: Position;
 }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -484,13 +519,13 @@ function DataTable({
               <th className="px-4 py-3 font-semibold">期号</th>
               <th className="px-4 py-3 font-semibold">开奖时间</th>
               <th className="px-4 py-3 font-semibold">开奖号码</th>
-              <th className="px-4 py-3 font-semibold">个位推荐 ({pickCount}码)</th>
+              <th className="px-4 py-3 font-semibold">{positionLabel(position)}推荐 ({pickCount}码)</th>
               <th className="px-4 py-3 font-semibold">是否中奖</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {data.map((row, idx) => {
-              const ge = row.numbers[4];
+              const digit = row.numbers[position - 1];
               const rec = recs.get(row.issue) ?? { picks: [], hit: false, eligible: false };
               return (
                 <tr key={row.issue} className="transition hover:bg-sky-50/60">
@@ -547,7 +582,7 @@ function DataTable({
   );
 }
 
-function FrequencyChart({ data, windowSize }: { data: DrawResult[]; windowSize: number }) {
+function FrequencyChart({ data, windowSize, position }: { data: DrawResult[]; windowSize: number; position: Position }) {
   const windowed = useMemo(() => {
     const newestFirst = [...data].sort((a, b) => b.issue.localeCompare(a.issue));
     return newestFirst.slice(0, windowSize);
@@ -555,10 +590,10 @@ function FrequencyChart({ data, windowSize }: { data: DrawResult[]; windowSize: 
 
   const stats = useMemo(() => {
     const counts = new Array(10).fill(0);
-    windowed.forEach((d) => counts[d.numbers[4]]++);
+    windowed.forEach((d) => counts[d.numbers[position - 1]]++);
     const max = Math.max(...counts);
     return counts.map((c, n) => ({ n, count: c, pct: max === 0 ? 0 : (c / max) * 100 }));
-  }, [windowed]);
+  }, [windowed, position]);
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -588,10 +623,10 @@ function FrequencyChart({ data, windowSize }: { data: DrawResult[]; windowSize: 
   );
 }
 
-function TrendChart({ data }: { data: DrawResult[] }) {
+function TrendChart({ data, position }: { data: DrawResult[]; position: Position }) {
   const reversed = useMemo(() => [...data].reverse(), [data]);
-  const points = reversed.map((d) => sum(d.numbers));
-  const maxV = 45;
+  const points = reversed.map((d) => d.numbers[position - 1]);
+  const maxV = 9;
   const minV = 0;
   const w = 800;
   const h = 280;
@@ -609,7 +644,7 @@ function TrendChart({ data }: { data: DrawResult[] }) {
     <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
       <div className="mb-4 flex items-center gap-2">
         <TrendingUp className="h-5 w-5 text-emerald-600" />
-        <h3 className="text-lg font-semibold text-slate-800">总和走势图</h3>
+        <h3 className="text-lg font-semibold text-slate-800">{positionLabel(position)}走势</h3>
       </div>
       <div className="overflow-x-auto">
         <svg viewBox={`0 0 ${w} ${h}`} className="w-full min-w-[640px]" preserveAspectRatio="none">
@@ -623,7 +658,7 @@ function TrendChart({ data }: { data: DrawResult[] }) {
               <stop offset="100%" stopColor="#10b981" />
             </linearGradient>
           </defs>
-          {[0, 10, 20, 30, 40, 45].map((v) => (
+          {[0, 2, 4, 5, 6, 9].map((v) => (
             <g key={v}>
               <line
                 x1={pad}
@@ -654,7 +689,7 @@ function TrendChart({ data }: { data: DrawResult[] }) {
         </svg>
       </div>
       <p className="mt-3 text-center text-xs text-slate-400">
-        虚线为大小分界 (25) · 共 {points.length} 期
+        虚线为大小分界 (5) · 共 {points.length} 期
       </p>
     </div>
   );
@@ -669,6 +704,7 @@ function ProfitSim({
   martingaleOn,
   martingaleFactor,
   martingaleReset,
+  position,
 }: {
   data: DrawResult[];
   recs: Map<string, RecResult>;
@@ -678,6 +714,7 @@ function ProfitSim({
   martingaleOn: boolean;
   martingaleFactor: number;
   martingaleReset: number;
+  position: Position;
 }) {
   const ODDS = 9.77;
   const BET_PER_NUMBER = 100;
@@ -720,7 +757,7 @@ function ProfitSim({
     for (const draw of eligible) {
       const rec = recs.get(draw.issue);
       const picks = rec?.picks ?? [];
-      const ge = draw.numbers[4];
+      const ge = draw.numbers[position - 1];
       const hit = rec?.hit ?? false;
       const stakeMul = multiplier;
       const baseCost = BET_PER_NUMBER * pickCount;
@@ -793,7 +830,7 @@ function ProfitSim({
       maxLossStreakAmount: maxLossStreakAmount.toFixed(2),
       maxLossStreakCount,
     };
-  }, [data, recs, pickCount, martingaleOn, martingaleFactor, martingaleReset]);
+  }, [data, recs, pickCount, martingaleOn, martingaleFactor, martingaleReset, position]);
 
   if (!hasEnough || sim.total === 0) {
     return (
@@ -1035,6 +1072,7 @@ function App() {
     }
   });
   const [gameId, setGameId] = useState<GameId>(readStoredGame);
+  const [position, setPosition] = useState<Position>(readStoredPosition);
   const [draws, setDraws] = useState<DrawResult[]>(() => readStoredDraws(readStoredGame()));
   const [loadingDraws, setLoadingDraws] = useState(false);
   const [drawsError, setDrawsError] = useState('');
@@ -1135,6 +1173,7 @@ function App() {
           issue,
           picks,
           betAmount,
+          position,
         }),
       });
       const data = await resp.json();
@@ -1153,7 +1192,7 @@ function App() {
     } finally {
       setPlacingBet(false);
     }
-  }, [sessionId, gameId, betAmount]);
+  }, [sessionId, gameId, betAmount, position]);
 
   const applyGame = useCallback((next: GameId) => {
     persistGame(next);
@@ -1171,8 +1210,8 @@ function App() {
   }, [sessionId, gameId, fetchDraws]);
 
   const recommendation = useMemo(
-    () => buildRecommendations(draws, windowSize, pickCount, excludeLast),
-    [draws, windowSize, pickCount, excludeLast]
+    () => buildRecommendations(draws, windowSize, pickCount, excludeLast, position),
+    [draws, windowSize, pickCount, excludeLast, position]
   );
 
   useEffect(() => {
@@ -1303,6 +1342,24 @@ function App() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600 shadow-sm">
+                <span className="whitespace-nowrap">位数</span>
+                <select
+                  value={position}
+                  onChange={(e) => {
+                    const next = Number.parseInt(e.target.value, 10) as Position;
+                    persistPosition(next);
+                    setPosition(next);
+                  }}
+                  className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 font-medium text-slate-800 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+                >
+                  {POSITION_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600 shadow-sm">
                 <span className="whitespace-nowrap">统计窗口</span>
                 <input
@@ -1507,7 +1564,7 @@ function App() {
                 value={overview.hitRate}
                 sub={
                   overview.evaluatedCount > 0
-                    ? `${pickCount}码个位推荐 · 共 ${overview.evaluatedCount} 期`
+                    ? `${pickCount}码${positionLabel(position)}推荐 · 共 ${overview.evaluatedCount} 期`
                     : `需至少 ${windowSize} 期才能推荐`
                 }
                 accent="bg-gradient-to-r from-violet-500 to-indigo-600"
@@ -1537,10 +1594,10 @@ function App() {
               <div className="mt-4 overflow-hidden rounded-2xl border border-sky-200 bg-gradient-to-br from-sky-50 to-emerald-50 p-6 shadow-sm">
                 <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="text-sm font-medium text-sky-700">本期个位推荐 ({pickCount}码)</p>
+                    <p className="text-sm font-medium text-sky-700">本期{positionLabel(position)}推荐 ({pickCount}码)</p>
                     <p className="mt-1 text-xs text-slate-500">
                       基于最近 {windowSize} 期热号频率 · 转移规律
-                      {excludeLast ? ' · 已排除上期个位' : ''}
+                      {excludeLast ? ` · 已排除上期${positionLabel(position)}` : ''}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1591,10 +1648,10 @@ function App() {
             {/* Content */}
             <div className="mt-6">
               {tab === 'table' && (
-                <DataTable data={filtered} recs={recommendation.recs} pickCount={pickCount} />
+                <DataTable data={filtered} recs={recommendation.recs} pickCount={pickCount} position={position} />
               )}
-              {tab === 'frequency' && <FrequencyChart data={draws} windowSize={windowSize} />}
-              {tab === 'trend' && <TrendChart data={draws} />}
+              {tab === 'frequency' && <FrequencyChart data={draws} windowSize={windowSize} position={position} />}
+              {tab === 'trend' && <TrendChart data={draws} position={position} />}
               {tab === 'profit' && (
                 <ProfitSim
                   data={draws}
@@ -1605,6 +1662,7 @@ function App() {
                   martingaleOn={martingaleOn}
                   martingaleFactor={martingaleFactor}
                   martingaleReset={martingaleReset}
+                  position={position}
                 />
               )}
               {tab === 'autobet' && (
@@ -1624,6 +1682,7 @@ function App() {
                   nextPicks={overview.nextPicks}
                   nextIssue={nextIssue(draws[0]?.issue ?? '')}
                   draws={draws}
+                  positionLabel={positionLabel(position)}
                   onPlaceBet={() => {
                     const issue = nextIssue(draws[0]?.issue ?? '');
                     if (issue && overview.nextPicks.length > 0) {

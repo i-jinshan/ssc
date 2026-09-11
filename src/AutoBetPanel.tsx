@@ -17,6 +17,7 @@ export interface BetRow {
   net: number;
   created_at: string;
   settled_at: string | null;
+  position: number;
 }
 
 interface AutoBetPanelProps {
@@ -29,6 +30,7 @@ interface AutoBetPanelProps {
   nextPicks: number[];
   nextIssue: string | null;
   draws: { issue: string; numbers: number[] }[];
+  positionLabel: string;
   onPlaceBet: () => void;
   placingBet: boolean;
 }
@@ -43,6 +45,7 @@ export function AutoBetPanel({
   nextPicks,
   nextIssue,
   draws,
+  positionLabel,
   onPlaceBet,
   placingBet,
 }: AutoBetPanelProps) {
@@ -166,7 +169,7 @@ export function AutoBetPanel({
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-amber-800">
-                  下一期自动投注: {nextIssue}
+                  下一期{positionLabel}自动投注: {nextIssue}
                 </p>
                 <p className="mt-1 text-xs text-amber-600">
                   {nextPicks.length} 码 · 每码 ¥{betAmount} · 共需 ¥{betAmount * nextPicks.length}

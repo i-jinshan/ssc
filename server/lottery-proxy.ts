@@ -48,6 +48,7 @@ interface BetRow {
   net: number;
   created_at: string;
   settled_at: string | null;
+  position: number;
 }
 
 const sessions = new Map<string, SessionRow>();
@@ -714,13 +715,17 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     if (action === "bet") {
       const body = await req.json();
-      const { sessionId, lotteryId, issue, picks, betAmount } = body as {
+      const { sessionId, lotteryId, issue, picks, betAmount, position } = body as {
         sessionId: string;
         lotteryId: number;
         issue: string;
         picks: number[];
         betAmount: number;
+        position?: number;
       };
+      const betPosition = position >= 1 && position <= 5 ? Math.round(position) : 5;
+      const numberParts = ["", "", "", "", ""];
+      numberParts[betPosition - 1] = "{pos}";
 
       if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
         return new Response(
@@ -824,8 +829,8 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         Bets: picks.map((n) => ({
           BetTypeCode: 21,
           BetTypeName: "",
-          Number: ",,,," + String(n),
-          Position: "5",
+          Number: numberParts.join(",").replace("{pos}", String(n)),
+          Position: String(betPosition),
           Unit: unit,
           Multiple: multiple,
           ReturnRate: 0,
@@ -897,6 +902,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         result_number: null,
         payout: 0,
         net: 0,
+        position: betPosition,
         created_at: new Date().toISOString(),
         settled_at: null,
       };
@@ -948,7 +954,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       const sessionBets = bets.get(sessionId) ?? [];
 
       for (const draw of draws) {
-        const resultNumber = draw.numbers[4];
+        const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
         const issueKey = draw.issue.includes("-")
           ? draw.issue
           : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);
