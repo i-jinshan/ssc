@@ -17,6 +17,9 @@ import { AutoBetPanel } from '@/AutoBetPanel';
 import type { BetPlatform } from '@/AutoBetPanel';
 import { API_URL, API_HEADERS } from '@/api';
 import type { DrawResult } from '@/lotteryData';
+import { nextMartingaleState, stakeWithMultiplier } from '@/martingale';
+
+export { nextMartingaleState, stakeWithMultiplier };
 
 type TabKey = 'table' | 'frequency' | 'trend' | 'profit' | 'autobet';
 
@@ -339,6 +342,48 @@ function nextIssue(issue: string): string | null {
   const width = seqStr.length;
   const sequence = Number.parseInt(seqStr, 10) + 1;
   return `${match[1]}-${String(sequence).padStart(width, '0')}`;
+}
+
+function issueSeq(issue: string): { day: string; seq: number } | null {
+  const compact = String(issue).replace(/-/g, '');
+  if (compact.length <= 8) return null;
+  const seq = Number.parseInt(compact.slice(8), 10);
+  if (!Number.isFinite(seq)) return null;
+  return { day: compact.slice(0, 8), seq };
+}
+
+function issueEarlier(a: string, b: string): boolean {
+  const left = issueSeq(a);
+  const right = issueSeq(b);
+  if (!left || !right) return a.replace(/-/g, '') < b.replace(/-/g, '');
+  if (left.day !== right.day) return left.day < right.day;
+  return left.seq < right.seq;
+}
+
+function sameIssue(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  return String(a).replace(/-/g, '') === String(b).replace(/-/g, '');
+}
+
+export function compareBetHistory(
+  a: { issue: string; created_at?: string },
+  b: { issue: string; created_at?: string },
+): number {
+  if (issueEarlier(a.issue, b.issue)) return -1;
+  if (issueEarlier(b.issue, a.issue)) return 1;
+  return String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''));
+}
+
+function liveIssuePollMs(gameId: number): number {
+  if (gameId === 60) return 3_000;
+  if (gameId === 127) return 4_000;
+  return 5_000;
+}
+
+function drawsPollMs(gameId: number): number {
+  if (gameId === 60) return 5_000;
+  if (gameId === 127) return 8_000;
+  return 10_000;
 }
 
 export const ballColor = (n: number): string => {
@@ -719,7 +764,7 @@ function ProfitSim({
   martingaleReset: number;
   position: Position;
 }) {
-  const ODDS = 9.77;
+  const ODDS = 9.49;
   const BET_PER_NUMBER = 100;
   const INITIAL_CAPITAL = 10000;
   const REBATE_PER_TURNOVER = 10000;
@@ -740,8 +785,7 @@ function ProfitSim({
     let lossStreakCount = 0;
     let maxLossStreakAmount = 0;
     let maxLossStreakCount = 0;
-    let multiplier = 1;
-    let martingaleLosses = 0;
+    const outcomes: Array<'won' | 'lost'> = [];
     const rows: {
       issue: string;
       time: string;
@@ -762,7 +806,7 @@ function ProfitSim({
       const picks = rec?.picks ?? [];
       const ge = draw.numbers[position - 1];
       const hit = rec?.hit ?? false;
-      const stakeMul = multiplier;
+      const stakeMul = nextMartingaleState(outcomes, martingaleOn, martingaleFactor, martingaleReset).multiplier;
       const baseCost = BET_PER_NUMBER * pickCount;
       const cost = baseCost * stakeMul;
       const ret = hit ? BET_PER_NUMBER * ODDS * stakeMul : 0;
@@ -774,12 +818,11 @@ function ProfitSim({
       totalWin += ret;
       totalRebate += rebate;
       totalBetNet += betNet;
+      outcomes.push(hit ? 'won' : 'lost');
       if (hit) {
         wins++;
         lossStreakAmount = 0;
         lossStreakCount = 0;
-        multiplier = 1;
-        martingaleLosses = 0;
       } else {
         losses++;
         lossStreakAmount += -betNet;
@@ -787,15 +830,6 @@ function ProfitSim({
         if (lossStreakAmount > maxLossStreakAmount) {
           maxLossStreakAmount = lossStreakAmount;
           maxLossStreakCount = lossStreakCount;
-        }
-        if (martingaleOn) {
-          martingaleLosses += 1;
-          if (martingaleLosses > martingaleReset) {
-            multiplier = 1;
-            martingaleLosses = 0;
-          } else {
-            multiplier *= martingaleFactor;
-          }
         }
       }
       rows.push({
@@ -1101,6 +1135,23 @@ function App() {
   const [betAmount, setBetAmount] = useState(readStoredBetAmount);
   const [placingBet, setPlacingBet] = useState(false);
   const [lastBetIssue, setLastBetIssue] = useState<string | null>(null);
+  const placingBetRef = useRef(false);
+  const lastBetIssueRef = useRef<string | null>(null);
+  const nextPicksRef = useRef<number[]>([]);
+  const placeBetRef = useRef<(issue: string, picks: number[]) => Promise<void>>(async () => {});
+  const martingaleWaitTimerRef = useRef<number | null>(null);
+  const drawsRef = useRef(draws);
+  const [scheduledBetAt, setScheduledBetAt] = useState<number | null>(null);
+  const [xyLiveIssue, setXyLiveIssue] = useState<{ issue: string; closeAt: number | null } | null>(null);
+  const xyLiveIssueRef = useRef<{ issue: string; closeAt: number | null } | null>(null);
+  const [autoBetServerError, setAutoBetServerError] = useState('');
+  const [autoBetPrompt, setAutoBetPrompt] = useState<{
+    platform?: string;
+    lotteryId?: number;
+    lastBetIssue?: string | null;
+    issue?: string | null;
+  } | null>(null);
+  const autoBetPromptedRef = useRef(false);
   const [platform, setPlatform] = useState<BetPlatform>(() => {
     try { return (localStorage.getItem(BET_PLATFORM_KEY) as BetPlatform) || 'aoshi'; } catch { return 'aoshi'; }
   });
@@ -1110,9 +1161,11 @@ function App() {
   const gameIdRef = useRef(gameId);
   gameIdRef.current = gameId;
 
-  const fetchDraws = useCallback(async (sid: string, lotteryId: GameId) => {
-    setLoadingDraws(true);
-    setDrawsError('');
+  const fetchDraws = useCallback(async (sid: string, lotteryId: GameId, quiet = false): Promise<DrawResult[]> => {
+    if (!quiet) {
+      setLoadingDraws(true);
+      setDrawsError('');
+    }
     try {
       const resp = await fetch(`${API_URL}?action=draws`, {
         method: 'POST',
@@ -1126,8 +1179,8 @@ function App() {
         setSessionId(null);
         setDraws([]);
         const payload = (await resp.json().catch(() => ({}))) as { error?: string };
-        setDrawsError(payload.error || '登录已过期，请重新登录');
-        return;
+        if (!quiet) setDrawsError(payload.error || '登录已过期，请重新登录');
+        return [];
       }
 
       if (!resp.ok) throw new Error(`获取数据失败 (${resp.status})`);
@@ -1138,18 +1191,23 @@ function App() {
       if (Array.isArray(data.draws) && data.draws.length > 0) {
         const next = mergeDraws(readStoredDraws(lotteryId), data.draws as DrawResult[]);
         persistDraws(lotteryId, next);
+        drawsRef.current = next;
         if (gameIdRef.current === lotteryId) {
           setDraws(next);
         }
-      } else if (gameIdRef.current === lotteryId) {
+        return next;
+      }
+      if (!quiet && gameIdRef.current === lotteryId) {
         setDrawsError('未获取到开奖数据，请稍后重试');
       }
+      return drawsRef.current;
     } catch (err) {
-      if (gameIdRef.current === lotteryId) {
+      if (!quiet && gameIdRef.current === lotteryId) {
         setDrawsError(err instanceof Error ? err.message : '获取数据失败');
       }
+      return drawsRef.current;
     } finally {
-      if (gameIdRef.current === lotteryId) {
+      if (!quiet && gameIdRef.current === lotteryId) {
         setLoadingDraws(false);
       }
     }
@@ -1167,15 +1225,73 @@ function App() {
     setDraws([]);
     setDrawsError('');
     setLastBetIssue(null);
+    lastBetIssueRef.current = null;
+  }, []);
+
+  const settleBets = useCallback(async (sid: string | null, drawList: DrawResult[]) => {
+    if (!sid || drawList.length === 0) return;
+    try {
+      await fetch(`${API_URL}?action=betsettle`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({
+          sessionId: sid,
+          draws: drawList.map((d) => ({ issue: d.issue, numbers: d.numbers })),
+        }),
+      });
+    } catch {
+      // ignore
+    }
   }, []);
 
   const placeBet = useCallback(async (issue: string, picks: number[]) => {
     if (!sessionId || !issue || picks.length === 0) return;
     if (platform === 'xingyi' && !xySessionId) return;
+    if (placingBetRef.current) return;
+    if (sameIssue(lastBetIssueRef.current, issue)) return;
+    placingBetRef.current = true;
     setPlacingBet(true);
     try {
       const action = platform === 'xingyi' ? 'xybet' : 'bet';
       const useSessionId = platform === 'xingyi' ? xySessionId : sessionId;
+      if (!useSessionId) return;
+
+      const latestDraws = await fetchDraws(sessionId, gameId, true);
+      await settleBets(useSessionId, latestDraws);
+      const listResp = await fetch(`${API_URL}?action=betlist`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId: useSessionId, lotteryId: gameId }),
+      });
+      const listData = await listResp.json() as { bets?: Array<{ issue: string; status: string; created_at?: string }> };
+      const list = Array.isArray(listData.bets) ? listData.bets : [];
+      const olderPending = list.some(
+        (bet) => bet.status === 'pending' && !sameIssue(bet.issue, issue) && issueEarlier(bet.issue, issue),
+      );
+      const live = xyLiveIssueRef.current;
+      const remainNow = live?.closeAt && sameIssue(live.issue, issue)
+        ? live.closeAt - Date.now()
+        : Number.POSITIVE_INFINITY;
+      if (olderPending && remainNow >= 2500) {
+        if (martingaleWaitTimerRef.current != null) {
+          window.clearTimeout(martingaleWaitTimerRef.current);
+        }
+        martingaleWaitTimerRef.current = window.setTimeout(() => {
+          martingaleWaitTimerRef.current = null;
+          void placeBetRef.current(issue, nextPicksRef.current);
+        }, 800);
+        return;
+      }
+
+      let amount = Number(betAmount) || 0;
+      if (martingaleOn) {
+        const results = list
+          .filter((bet) => bet.status === 'won' || bet.status === 'lost')
+          .sort(compareBetHistory)
+          .map((bet) => bet.status as 'won' | 'lost');
+        const { multiplier } = nextMartingaleState(results, true, martingaleFactor, martingaleReset);
+        amount = stakeWithMultiplier(betAmount, multiplier);
+      }
       const resp = await fetch(`${API_URL}?action=${action}`, {
         method: 'POST',
         headers: API_HEADERS,
@@ -1184,17 +1300,24 @@ function App() {
           lotteryId: gameId,
           issue,
           picks,
-          betAmount,
+          betAmount: amount,
           position,
         }),
       });
-      const data = await resp.json();
+      const data = await resp.json() as { success?: boolean; error?: string; issue?: string; retry?: boolean; debug?: unknown };
       if (data.success) {
-        setLastBetIssue(issue);
+        if (martingaleWaitTimerRef.current != null) {
+          window.clearTimeout(martingaleWaitTimerRef.current);
+          martingaleWaitTimerRef.current = null;
+        }
+        const actual = typeof data.issue === 'string' && data.issue ? data.issue : issue;
+        lastBetIssueRef.current = actual;
+        setLastBetIssue(actual);
         setBetError('');
         setBetDebug('');
-      } else if (data.error) {
-        setBetError(`${data.error}（接口状态 ${resp.status}）`);
+      } else {
+        const message = data.error || '投注未成功';
+        setBetError(`${message}（接口状态 ${resp.status}）`);
       }
       if (data.debug) {
         setBetDebug(JSON.stringify(data.debug, null, 2));
@@ -1202,9 +1325,12 @@ function App() {
     } catch {
       setBetError('投注请求失败，请检查网络连接');
     } finally {
+      placingBetRef.current = false;
       setPlacingBet(false);
     }
-  }, [sessionId, gameId, betAmount, position, platform, xySessionId]);
+  }, [sessionId, gameId, betAmount, position, platform, xySessionId, martingaleOn, martingaleFactor, martingaleReset, settleBets, fetchDraws]);
+  placeBetRef.current = placeBet;
+  drawsRef.current = draws;
 
   const applyGame = useCallback((next: GameId) => {
     persistGame(next);
@@ -1212,29 +1338,182 @@ function App() {
     setDraws(readStoredDraws(next));
     setDrawsError('');
     setSearch('');
+    setLastBetIssue(null);
+    lastBetIssueRef.current = null;
   }, []);
 
   useEffect(() => {
     if (!sessionId) return;
     fetchDraws(sessionId, gameId);
-    const interval = setInterval(() => fetchDraws(sessionId, gameId), 60000);
+    const interval = setInterval(() => fetchDraws(sessionId, gameId), drawsPollMs(gameId));
     return () => clearInterval(interval);
   }, [sessionId, gameId, fetchDraws]);
+
+  useEffect(() => {
+    if (draws.length === 0) return;
+    void settleBets(sessionId, draws);
+    void settleBets(xySessionId, draws);
+  }, [draws, sessionId, xySessionId, settleBets]);
 
   const recommendation = useMemo(
     () => buildRecommendations(draws, windowSize, pickCount, excludeLast, position),
     [draws, windowSize, pickCount, excludeLast, position]
   );
+  nextPicksRef.current = recommendation.nextPicks;
 
   useEffect(() => {
-    if (!autoBetOn || !sessionId || draws.length === 0 || !recommendation.hasEnough) return;
+    if (platform !== 'xingyi' || !xySessionId) {
+      setXyLiveIssue(null);
+      xyLiveIssueRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const resp = await fetch(`${API_URL}?action=xyissue`, {
+          method: 'POST',
+          headers: API_HEADERS,
+          body: JSON.stringify({ sessionId: xySessionId, lotteryId: gameId }),
+        });
+        const data = await resp.json() as { issue?: string; closeAt?: number | null };
+        if (cancelled || typeof data.issue !== 'string' || !data.issue) return;
+        const next = { issue: data.issue, closeAt: typeof data.closeAt === 'number' ? data.closeAt : null };
+        xyLiveIssueRef.current = next;
+        setXyLiveIssue(next);
+      } catch {
+        // keep last known issue
+      }
+    };
+    void pull();
+    const timer = window.setInterval(pull, liveIssuePollMs(gameId));
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [platform, xySessionId, gameId]);
+
+  useEffect(() => {
+    if (!sessionId) {
+      autoBetPromptedRef.current = false;
+      setAutoBetPrompt(null);
+      return;
+    }
+    if (autoBetPromptedRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`${API_URL}?action=autobet-status`, {
+          method: 'POST',
+          headers: API_HEADERS,
+          body: '{}',
+        });
+        const data = await resp.json() as {
+          running?: boolean;
+          platform?: string;
+          lotteryId?: number;
+          lastBetIssue?: string | null;
+          issue?: string | null;
+        };
+        if (cancelled || !data.running) return;
+        autoBetPromptedRef.current = true;
+        persistAutoBetOn(true);
+        setAutoBetOn(true);
+        setAutoBetPrompt({
+          platform: data.platform,
+          lotteryId: data.lotteryId,
+          lastBetIssue: data.lastBetIssue,
+          issue: data.issue,
+        });
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!autoBetOn || !sessionId) return;
     if (platform === 'xingyi' && !xySessionId) return;
-    const targetIssue = nextIssue(draws[0]?.issue ?? '');
-    if (!targetIssue || targetIssue === lastBetIssue) return;
-    const picks = recommendation.nextPicks;
-    if (picks.length === 0) return;
-    placeBet(targetIssue, picks);
-  }, [autoBetOn, sessionId, draws, recommendation, lastBetIssue, placeBet, platform, xySessionId]);
+    void fetch(`${API_URL}?action=autobet-start`, {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify({
+        platform,
+        sessionId,
+        xySessionId,
+        lotteryId: gameId,
+        position,
+        windowSize,
+        pickCount,
+        excludeLast,
+        betAmount,
+        martingaleOn,
+        martingaleFactor,
+        martingaleReset,
+      }),
+    })
+      .then(async (resp) => {
+        const data = await resp.json() as { error?: string; scheduledAt?: number | null };
+        if (data.error) setAutoBetServerError(data.error);
+        else setAutoBetServerError('');
+        if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
+      })
+      .catch(() => setAutoBetServerError('无法启动后台自动投注，请确认本地服务在运行'));
+  }, [
+    autoBetOn,
+    sessionId,
+    xySessionId,
+    platform,
+    gameId,
+    position,
+    windowSize,
+    pickCount,
+    excludeLast,
+    betAmount,
+    martingaleOn,
+    martingaleFactor,
+    martingaleReset,
+  ]);
+
+  useEffect(() => {
+    if (!autoBetOn) return;
+    const pull = async () => {
+      try {
+        const resp = await fetch(`${API_URL}?action=autobet-status`, {
+          method: 'POST',
+          headers: API_HEADERS,
+          body: '{}',
+        });
+        const data = await resp.json() as {
+          running?: boolean;
+          scheduledAt?: number | null;
+          lastError?: string;
+          lastBetIssue?: string | null;
+          issue?: string | null;
+          closeAt?: number | null;
+        };
+        if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
+        else setScheduledBetAt(null);
+        setAutoBetServerError(data.lastError || '');
+        if (typeof data.lastBetIssue === 'string' && data.lastBetIssue) {
+          lastBetIssueRef.current = data.lastBetIssue;
+          setLastBetIssue(data.lastBetIssue);
+        }
+        if (typeof data.issue === 'string' && data.issue) {
+          const next = { issue: data.issue, closeAt: typeof data.closeAt === 'number' ? data.closeAt : null };
+          xyLiveIssueRef.current = next;
+          setXyLiveIssue(next);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    void pull();
+    const timer = window.setInterval(pull, 2000);
+    return () => window.clearInterval(timer);
+  }, [autoBetOn]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
@@ -1323,6 +1602,53 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 via-slate-50 to-sky-50">
+      {autoBetPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+              <Zap className="h-5 w-5" />
+            </div>
+            <h2 className="mt-4 text-lg font-semibold text-slate-900">后台自动投注仍在运行</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              上次关掉网页后，自动投注一直在本机服务里继续下。
+              {autoBetPrompt.platform === 'xingyi' ? '平台：星亿娱乐。' : autoBetPrompt.platform === 'aoshi' ? '平台：傲世皇朝。' : ''}
+              {typeof autoBetPrompt.lotteryId === 'number' && isGameId(autoBetPrompt.lotteryId)
+                ? `彩种：${gameLabel(autoBetPrompt.lotteryId)}。`
+                : ''}
+              {autoBetPrompt.issue ? `当前期 ${autoBetPrompt.issue}。` : ''}
+              {autoBetPrompt.lastBetIssue ? `最近已投 ${autoBetPrompt.lastBetIssue}。` : ''}
+              要现在关闭吗？
+            </p>
+            <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  void fetch(`${API_URL}?action=autobet-stop`, {
+                    method: 'POST',
+                    headers: API_HEADERS,
+                    body: '{}',
+                  }).catch(() => {});
+                  persistAutoBetOn(false);
+                  setAutoBetOn(false);
+                  setScheduledBetAt(null);
+                  setAutoBetServerError('');
+                  setAutoBetPrompt(null);
+                }}
+                className="rounded-xl border border-rose-200 bg-white px-4 py-2.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50"
+              >
+                关闭自动投注
+              </button>
+              <button
+                type="button"
+                onClick={() => setAutoBetPrompt(null)}
+                className="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-emerald-600"
+              >
+                继续运行
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/80 backdrop-blur-lg">
         <div className="mx-auto max-w-6xl px-4 py-4 sm:px-6">
@@ -1685,6 +2011,18 @@ function App() {
                   autoBetOn={autoBetOn}
                   onToggleAutoBet={(on) => {
                     persistAutoBetOn(on);
+                    if (on) {
+                      lastBetIssueRef.current = null;
+                      setLastBetIssue(null);
+                    } else {
+                      void fetch(`${API_URL}?action=autobet-stop`, {
+                        method: 'POST',
+                        headers: API_HEADERS,
+                        body: '{}',
+                      }).catch(() => {});
+                      setScheduledBetAt(null);
+                      setAutoBetServerError('');
+                    }
                     setAutoBetOn(on);
                   }}
                   betAmount={betAmount}
@@ -1692,8 +2030,9 @@ function App() {
                     persistBetAmount(amount);
                     setBetAmount(amount);
                   }}
+                  autoBetError={autoBetServerError}
                   nextPicks={overview.nextPicks}
-                  nextIssue={nextIssue(draws[0]?.issue ?? '')}
+                  nextIssue={xyLiveIssue?.issue ?? nextIssue(draws[0]?.issue ?? '')}
                   draws={draws}
                   positionLabel={positionLabel(position)}
                   onPlaceBet={() => {
@@ -1703,6 +2042,10 @@ function App() {
                     }
                   }}
                   placingBet={placingBet}
+                  scheduledBetAt={scheduledBetAt}
+                  martingaleOn={martingaleOn}
+                  martingaleFactor={martingaleFactor}
+                  martingaleReset={martingaleReset}
                   platform={platform}
                   onPlatformChange={(next) => {
                     try { localStorage.setItem(BET_PLATFORM_KEY, next); } catch { /* ignore */ }

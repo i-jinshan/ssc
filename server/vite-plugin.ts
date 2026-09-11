@@ -13,6 +13,10 @@ function loadHandler() {
   return handlerPromise;
 }
 
+function shouldReloadProxy(file: string): boolean {
+  return /lottery-proxy|auto-bet-engine|bet-ledger|martingale/.test(file.replace(/\\/g, '/'));
+}
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of req) {
@@ -73,6 +77,10 @@ export function lotteryProxyPlugin(): Plugin {
   return {
     name: 'lottery-proxy-local',
     configureServer(server) {
+      server.watcher.on('change', (file) => {
+        if (!shouldReloadProxy(file)) return;
+        handlerPromise = null;
+      });
       attach(server);
     },
     configurePreviewServer(server) {

@@ -1,8 +1,11 @@
 /** Local lottery proxy. Sessions live in memory for this Node process; no Supabase. */
 
 import { Buffer } from "node:buffer";
+import { writeFileSync } from "node:fs";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import type { Dispatcher } from "undici";
+import { handleAutoBetHttp, setProxyCall } from "./auto-bet-engine";
+import { clearLedger, dailySummary, loadLedger, persistLedgerNow, removeBet, upsertBet } from "./bet-ledger";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -25,6 +28,34 @@ function resolveLotteryId(raw: unknown): number {
 function trendPath(lotteryId: number, issueLimit: number): string {
   return `/DrawHistory/Trend/${lotteryId}?issue=${issueLimit}&day=0`;
 }
+
+function issueKeys(issue: string): string[] {
+  const raw = String(issue ?? "");
+  const compact = raw.replace(/-/g, "");
+  const hyphen = compact.length > 8 ? `${compact.slice(0, 8)}-${compact.slice(8)}` : raw;
+  return [...new Set([raw, compact, hyphen].filter(Boolean))];
+}
+
+function issuesMatch(a: string, b: string): boolean {
+  const left = new Set(issueKeys(a));
+  return issueKeys(b).some((key) => left.has(key));
+}
+
+function betDedupeKey(sessionId: string, lotteryId: number, issue: string): string {
+  return `${sessionId}:${lotteryId}:${String(issue).replace(/-/g, "")}`;
+}
+
+function hasPendingBet(sessionId: string, lotteryId: number, issue: string): boolean {
+  const list = bets.get(sessionId) ?? [];
+  return list.some(
+    (bet) =>
+      bet.status === "pending" &&
+      bet.lottery_id === lotteryId &&
+      issuesMatch(bet.issue, issue),
+  );
+}
+
+const placingBetKeys = new Set<string>();
 
 interface SessionRow {
   id: string;
@@ -52,10 +83,17 @@ interface BetRow {
   created_at: string;
   settled_at: string | null;
   position: number;
+  remote_ids?: string[];
 }
 
 const sessions = new Map<string, SessionRow>();
 const bets = new Map<string, BetRow[]>();
+
+for (const bet of loadLedger()) {
+  if (!bets.has(bet.session_id)) bets.set(bet.session_id, []);
+  const list = bets.get(bet.session_id)!;
+  if (!list.some((item) => item.id === bet.id)) list.push(bet);
+}
 
 let cachedProxyUrl: string | undefined;
 let cachedDispatcher: Dispatcher | undefined;
@@ -330,6 +368,9 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
   try {
     const url = new URL(req.url);
     const action = url.searchParams.get("action") ?? "captcha";
+
+    const autoBetResp = await handleAutoBetHttp(action, req);
+    if (autoBetResp) return autoBetResp;
 
     if (action === "captcha") {
       // Step 1: Fetch homepage to get antiforgery cookie + token
@@ -747,6 +788,15 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
       const cookies = session.cookies;
 
+      const aoshiDedupeKey = betDedupeKey(sessionId, lotteryId, issue);
+      if (placingBetKeys.has(aoshiDedupeKey) || hasPendingBet(sessionId, lotteryId, issue)) {
+        return new Response(
+          JSON.stringify({ success: true, duplicate: true, issue }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      placingBetKeys.add(aoshiDedupeKey);
+      try {
       // Step 1: Load the bet page first to establish session state and get anti-forgery token
       const betPageUrl = LOTTERY_BASE + "/Bet/Index?gid=" + lotteryId;
       let betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
@@ -826,6 +876,12 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       // Persist updated cookies back to the session
       sessions.set(sessionId, { ...session, cookies: betPageCookies });
 
+      const serialNumber = issue.replace(/-/g, "");
+      const guid = generateBetGuid();
+      const unit = 2;
+      const multiple = Math.max(1, Math.round(betAmount / unit));
+      const betId = crypto.randomUUID();
+
       const betData = {
         LotteryGameID: realGameId,
         SerialNumber: serialNumber,
@@ -877,11 +933,6 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
-      const serialNumber = issue.replace("-", "");
-      const guid = generateBetGuid();
-      const unit = 2;
-      const multiple = Math.max(1, Math.round(betAmount / unit));
-
       const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
       if (hasError) {
         return new Response(
@@ -912,25 +963,29 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
       if (!bets.has(sessionId)) bets.set(sessionId, []);
       bets.get(sessionId)!.push(bet);
+      upsertBet(bet);
 
       return new Response(
-        JSON.stringify({ success: true, betId, betResult }),
+        JSON.stringify({ success: true, betId, betResult, issue }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+      } finally {
+        placingBetKeys.delete(aoshiDedupeKey);
+      }
     }
 
     if (action === "betlist") {
       const body = await req.json();
-      const { sessionId, lotteryId, status } = body as {
-        sessionId: string;
+      const { lotteryId, status } = body as {
+        sessionId?: string;
         lotteryId?: number;
         status?: string;
       };
 
-      let list = bets.get(sessionId) ?? [];
+      let list = loadLedger();
       if (lotteryId) list = list.filter((b) => b.lottery_id === lotteryId);
       if (status) list = list.filter((b) => b.status === status);
-      list = [...list].sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? "")).slice(0, 200);
+      list = [...list].sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? "")).slice(0, 2000);
 
       return new Response(
         JSON.stringify({ bets: list }),
@@ -952,20 +1007,19 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
-      const ODDS = 9.77;
+      const ODDS = 9.49;
       let settledCount = 0;
-      const sessionBets = bets.get(sessionId) ?? [];
+      const sessionBets = [...bets.values()].flat();
 
       for (const draw of draws) {
-        const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
-        const issueKey = draw.issue.includes("-")
-          ? draw.issue
-          : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);
+        if (!Array.isArray(draw.numbers) || draw.numbers.length < 1) continue;
 
         for (const bet of sessionBets) {
           if (bet.status !== "pending") continue;
-          if (bet.issue !== draw.issue && bet.issue !== issueKey) continue;
+          if (!issuesMatch(bet.issue, draw.issue)) continue;
 
+          const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
+          if (typeof resultNumber !== "number" || !Number.isFinite(resultNumber)) continue;
           const hit = bet.picks.includes(resultNumber);
           const payout = hit ? bet.bet_amount * ODDS : 0;
           const net = payout - bet.total_cost;
@@ -975,8 +1029,10 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           bet.net = net;
           bet.settled_at = new Date().toISOString();
           settledCount++;
+          upsertBet(bet);
         }
       }
+      if (settledCount > 0) persistLedgerNow();
 
       return new Response(
         JSON.stringify({ success: true, settledCount }),
@@ -986,7 +1042,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     if (action === "betdelete") {
       const body = await req.json();
-      const { betId } = body as { betId: string };
+      const { betId, sessionId } = body as { betId: string; sessionId?: string };
 
       if (!betId) {
         return new Response(
@@ -995,14 +1051,146 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
-      for (const [sid, list] of bets.entries()) {
-        const idx = list.findIndex((b) => b.id === betId);
-        if (idx >= 0) {
-          list.splice(idx, 1);
-          bets.set(sid, list);
-          break;
+      let foundSid: string | null = sessionId && bets.has(sessionId) ? sessionId : null;
+      let foundIdx = -1;
+      if (foundSid) {
+        foundIdx = (bets.get(foundSid) ?? []).findIndex((b) => b.id === betId);
+        if (foundIdx < 0) foundSid = null;
+      }
+      if (!foundSid) {
+        for (const [sid, list] of bets.entries()) {
+          const idx = list.findIndex((b) => b.id === betId);
+          if (idx >= 0) {
+            foundSid = sid;
+            foundIdx = idx;
+            break;
+          }
         }
       }
+      if (!foundSid || foundIdx < 0) {
+        return new Response(
+          JSON.stringify({ error: "找不到该投注记录" }),
+          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const list = bets.get(foundSid) ?? [];
+      const target = list[foundIdx];
+      const session = sessions.get(foundSid);
+      const xyToken = session?.login_token ?? "";
+
+      if (xyToken && target.status === "pending") {
+        const xyBase = "https://s.xybet00.com";
+        const referer = `${xyBase}/Bet/${target.lottery_id}`;
+        const xyPost = async (path: string, payload?: unknown) => {
+          const resp = await lotteryFetch(xyBase + path, {
+            method: "POST",
+            headers: {
+              "User-Agent": UA,
+              Accept: "application/json, text/javascript, */*; q=0.01",
+              "X-Requested-With": "XMLHttpRequest",
+              Origin: xyBase,
+              Referer: referer,
+              Authorization: "Bearer " + xyToken,
+              "Content-Type": "application/json; charset=utf-8",
+              ...(session?.cookies ? { Cookie: session.cookies } : {}),
+            },
+            body: JSON.stringify(payload ?? {}),
+            redirect: "manual",
+            signal: AbortSignal.timeout(20000),
+          });
+          const cookies = mergeCookies(session?.cookies ?? "", parseSetCookie(resp.headers));
+          if (session) sessions.set(foundSid!, { ...session, cookies });
+          const text = await resp.text();
+          let data: Record<string, unknown> = {};
+          try {
+            const parsed = JSON.parse(text) as unknown;
+            data = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+              ? parsed as Record<string, unknown>
+              : { Data: parsed };
+          } catch {
+            data = { rawText: text.slice(0, 800) };
+          }
+          return { status: resp.status, data };
+        };
+
+        const collectIds = (value: unknown): string[] => {
+          const ids: string[] = [];
+          const push = (item: unknown) => {
+            if (typeof item === "string" && item) ids.push(item);
+            else if (typeof item === "number" && Number.isFinite(item)) ids.push(String(item));
+            else if (item && typeof item === "object" && !Array.isArray(item)) {
+              const rec = item as Record<string, unknown>;
+              for (const key of ["ID", "Id", "id", "BetID"]) push(rec[key]);
+            }
+          };
+          if (Array.isArray(value)) value.forEach(push);
+          else push(value);
+          return [...new Set(ids)];
+        };
+
+        let remoteIds = [...(target.remote_ids ?? [])];
+        if (remoteIds.length === 0) {
+          try {
+            const search = await xyPost("/api/BetRecord/Search", {
+              StartDaysFromNow: -1,
+              EndDaysFromNow: 0,
+            });
+            const payload = search.data.Data ?? search.data.data ?? search.data;
+            const records = Array.isArray(payload)
+              ? payload
+              : Array.isArray((payload as { data?: unknown })?.data)
+                ? (payload as { data: unknown[] }).data
+                : [];
+            const compactIssue = String(target.issue).replace(/-/g, "");
+            remoteIds = records.flatMap((row) => {
+              if (!row || typeof row !== "object") return [];
+              const rec = row as Record<string, unknown>;
+              const gameId = Number(rec.LotteryGameId ?? rec.LotteryGameID ?? rec.lotteryGameId);
+              const serial = String(rec.SerialNumber ?? rec.IssueSerialNumber ?? rec.serialNumber ?? "").replace(/-/g, "");
+              const state = rec.State ?? rec.state;
+              const isOpen = state === 0 || state === "BET" || state === "Bet";
+              if (gameId === target.lottery_id && serial === compactIssue && isOpen) {
+                return collectIds(rec);
+              }
+              return [];
+            });
+          } catch {
+            // ignore lookup failure; cancel will fail below if still empty
+          }
+        }
+
+        if (remoteIds.length === 0) {
+          return new Response(
+            JSON.stringify({ error: "找不到星亿娱乐对应注单，无法同步撤单" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+
+        for (const remoteId of remoteIds) {
+          const cancelResp = await xyPost(`/api/Bet/Cancel/${remoteId}`);
+          if (cancelResp.status === 401 || cancelResp.status === 403) {
+            return new Response(
+              JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录后再撤单" }),
+              { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+          const code = cancelResp.data.Code ?? cancelResp.data.code;
+          const alreadyGone = code === 1 && /已撤|已经撤|不存在|关盘/.test(String(cancelResp.data.CodeStr ?? cancelResp.data.ErrorMessage ?? ""));
+          if (code !== 0 && code !== "0" && !alreadyGone) {
+            const message = String(cancelResp.data.CodeStr ?? cancelResp.data.ErrorMessage ?? cancelResp.data.error ?? "星亿娱乐撤单失败");
+            return new Response(
+              JSON.stringify({ error: message }),
+              { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+        }
+      }
+
+      list.splice(foundIdx, 1);
+      bets.set(foundSid, list);
+      removeBet(betId);
+      persistLedgerNow();
 
       return new Response(
         JSON.stringify({ success: true }),
@@ -1034,7 +1222,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       return mergeCookies(parseSetCookie(r1.headers), parseSetCookie(r2.headers));
     }
 
-    async function xyApi(path: string, body: unknown, cookieStr: string): Promise<{ data: Record<string, unknown>; cookies: string; status: number }> {
+    async function xyApi(path: string, body: unknown, cookieStr: string, token?: string): Promise<{ data: Record<string, unknown>; cookies: string; status: number; text: string }> {
       const resp = await lotteryFetch(XY_BASE + path, {
         method: "POST",
         headers: {
@@ -1043,8 +1231,9 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           "X-Requested-With": "XMLHttpRequest",
           Referer: XY_BASE + "/",
           ...(cookieStr ? { Cookie: cookieStr } : {}),
+          ...(token ? { Authorization: "Bearer " + token, Token: token } : {}),
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(body ?? {}),
         redirect: "manual",
         signal: AbortSignal.timeout(15000),
       });
@@ -1053,7 +1242,205 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       const text = await resp.text();
       let data: Record<string, unknown> = {};
       try { data = JSON.parse(text); } catch { data = { rawText: text }; }
-      return { data, cookies: merged, status: resp.status };
+      return { data, cookies: merged, status: resp.status, text };
+    }
+
+    function xyPayload(data: Record<string, unknown>): Record<string, unknown> {
+      const inner = data.Data;
+      if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+        return inner as Record<string, unknown>;
+      }
+      return data;
+    }
+
+    function xyExtractAccessToken(data: Record<string, unknown>): string {
+      const fromValue = (value: unknown): string => {
+        if (typeof value === "string" && value.length > 8) return value;
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          const rec = value as Record<string, unknown>;
+          for (const key of ["access_token", "AccessToken", "Token", "token"]) {
+            const inner = rec[key];
+            if (typeof inner === "string" && inner.length > 8) return inner;
+          }
+        }
+        return "";
+      };
+      const sources = [data, xyPayload(data)];
+      for (const src of sources) {
+        for (const key of ["Token", "token", "access_token", "AccessToken"]) {
+          const found = fromValue(src[key]);
+          if (found) return found;
+        }
+        const direct = fromValue(src);
+        if (direct) return direct;
+      }
+      return "";
+    }
+
+    function pickNumericBalance(obj: unknown, depth = 0): number | null {
+      if (obj == null || depth > 8) return null;
+      if (typeof obj === "number" && Number.isFinite(obj)) return obj;
+      if (typeof obj === "string") {
+        const n = Number(obj.replace(/,/g, "").replace(/¥/g, "").trim());
+        if (Number.isFinite(n)) return n;
+      }
+      if (Array.isArray(obj)) {
+        for (const item of obj) {
+          const found = pickNumericBalance(item, depth + 1);
+          if (found != null) return found;
+        }
+        return null;
+      }
+      if (typeof obj !== "object") return null;
+      const rec = obj as Record<string, unknown>;
+      const preferred = [
+        "WalletAmount", "walletAmount", "Balance", "balance",
+        "Amount", "amount", "Credit", "credit",
+        "Money", "AvailableBalance", "MemberBalance",
+        "Available", "Cash", "AccountBalance", "Data", "data", "Value", "value",
+        "Info", "Member", "member",
+      ];
+      for (const key of preferred) {
+        if (key in rec) {
+          const found = pickNumericBalance(rec[key], depth + 1);
+          if (found != null) return found;
+        }
+      }
+      for (const value of Object.values(rec)) {
+        if (value && typeof value === "object") {
+          const found = pickNumericBalance(value, depth + 1);
+          if (found != null) return found;
+        }
+      }
+      return null;
+    }
+
+    async function xyFetchWalletAmount(cookieStr: string, token: string): Promise<{
+      balance: number | null;
+      cookies: string;
+      debug: { status: number; contentType: string; body: string; tokenLen: number };
+    }> {
+      const attempts: Array<{ contentType: string; body?: string }> = [
+        { contentType: "application/x-www-form-urlencoded; charset=UTF-8", body: "" },
+        { contentType: "application/json; charset=utf-8", body: "{}" },
+      ];
+      let cookies = cookieStr;
+      let debug = { status: 0, contentType: "", body: "", tokenLen: token.length };
+      for (const attempt of attempts) {
+        try {
+          const resp = await lotteryFetch(XY_BASE + "/api/Wallet/GetWalletAmount", {
+            method: "POST",
+            headers: {
+              "User-Agent": UA,
+              "Content-Type": attempt.contentType,
+              Accept: "application/json, text/javascript, */*; q=0.01",
+              "X-Requested-With": "XMLHttpRequest",
+              Origin: XY_BASE,
+              Referer: XY_BASE + "/",
+              Authorization: "Bearer " + token,
+              ...(cookies ? { Cookie: cookies } : {}),
+            },
+            body: attempt.body || undefined,
+            redirect: "manual",
+            signal: AbortSignal.timeout(15000),
+          });
+          cookies = mergeCookies(cookies, parseSetCookie(resp.headers));
+          const text = await resp.text();
+          debug = {
+            status: resp.status,
+            contentType: resp.headers.get("content-type") ?? "",
+            body: text.slice(0, 1500),
+            tokenLen: token.length,
+          };
+          let parsed: unknown = text;
+          try { parsed = JSON.parse(text); } catch { parsed = text; }
+          const balance = pickNumericBalance(parsed);
+          if (balance != null && Number.isFinite(balance) && resp.status < 400) {
+            return { balance, cookies, debug };
+          }
+        } catch (err) {
+          debug = {
+            status: 0,
+            contentType: "",
+            body: err instanceof Error ? err.message : String(err),
+            tokenLen: token.length,
+          };
+        }
+      }
+      return { balance: null, cookies, debug };
+    }
+
+    async function xyAuthorizedFetch(
+      path: string,
+      cookieStr: string,
+      token: string,
+      opts: { method?: string; body?: unknown; referer?: string } = {},
+    ) {
+      const method = opts.method ?? "POST";
+      const referer = opts.referer ?? (XY_BASE + "/");
+      const hasBody = method !== "GET" && method !== "HEAD";
+      const resp = await lotteryFetch(XY_BASE + path, {
+        method,
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json, text/javascript, */*; q=0.01",
+          "X-Requested-With": "XMLHttpRequest",
+          Origin: XY_BASE,
+          Referer: referer,
+          Authorization: "Bearer " + token,
+          ...(hasBody ? { "Content-Type": "application/json; charset=utf-8" } : {}),
+          ...(cookieStr ? { Cookie: cookieStr } : {}),
+        },
+        body: hasBody ? JSON.stringify(opts.body ?? {}) : undefined,
+        redirect: "manual",
+        signal: AbortSignal.timeout(20000),
+      });
+      const cookies = mergeCookies(cookieStr, parseSetCookie(resp.headers));
+      const text = await resp.text();
+      let data: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(text) as unknown;
+        data = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : { Data: parsed };
+      } catch {
+        data = { rawText: text.slice(0, 800) };
+      }
+      return { status: resp.status, cookies, data, text };
+    }
+
+    function xyAuthorizedPost(path: string, body: unknown, cookieStr: string, token: string, referer?: string) {
+      return xyAuthorizedFetch(path, cookieStr, token, { method: "POST", body, referer });
+    }
+
+    function hyphenIssue(serial: string): string {
+      const compact = String(serial).replace(/-/g, "");
+      if (compact.length > 8) return `${compact.slice(0, 8)}-${compact.slice(8)}`;
+      return String(serial);
+    }
+
+    function xyCurrentIssueInfo(data: Record<string, unknown>): { serial: string; closeAt: number | null } {
+      const sources = [data, xyPayload(data)];
+      for (const src of sources) {
+        const current = src.CurrentIssue;
+        if (current && typeof current === "object" && !Array.isArray(current)) {
+          const rec = current as Record<string, unknown>;
+          const serialRaw = rec.SerialNumber ?? rec.serialNumber;
+          let serial = "";
+          if (typeof serialRaw === "string" && serialRaw) serial = serialRaw;
+          else if (typeof serialRaw === "number" && Number.isFinite(serialRaw)) serial = String(serialRaw);
+          const closeRaw = rec.CloseTimeStamp ?? rec.closeTimeStamp ?? rec.CloseTime ?? rec.EndTimeStamp;
+          let closeAt: number | null = null;
+          if (typeof closeRaw === "number" && Number.isFinite(closeRaw)) {
+            closeAt = closeRaw < 1e12 ? closeRaw * 1000 : closeRaw;
+          } else if (typeof closeRaw === "string" && closeRaw) {
+            const n = Number(closeRaw);
+            if (Number.isFinite(n)) closeAt = n < 1e12 ? n * 1000 : n;
+          }
+          if (serial) return { serial, closeAt };
+        }
+      }
+      return { serial: "", closeAt: null };
     }
 
     if (action === "xycaptcha") {
@@ -1141,19 +1528,48 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         GooglePassword: "",
       }, session.cookies ?? "");
 
-      const graphicsResult = loginResp.data.GraphicsResult as number | undefined;
+      const payload = xyPayload(loginResp.data);
+      const graphicsResult = (payload.GraphicsResult ?? loginResp.data.GraphicsResult) as number | undefined;
       if (graphicsResult !== undefined && graphicsResult !== 0) {
         return new Response(
           JSON.stringify({ success: false, error: "验证码已过期，请刷新验证码后重试" }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      const result = loginResp.data.Result as number | undefined;
-      if (result === 0) {
-        const token = (loginResp.data.Token as string) || "";
-        sessions.set(sessionId, { ...session, cookies: loginResp.cookies, login_token: token, authenticated: true });
+      const result = (payload.Result ?? loginResp.data.Result) as number | undefined;
+      const token = xyExtractAccessToken(loginResp.data);
+      if (result === 0 || token) {
+        let cookies = loginResp.cookies;
+        let loginBalance = pickNumericBalance(payload);
+        let walletDebug = null as unknown;
+        try {
+          const wallet = await xyFetchWalletAmount(cookies, token);
+          cookies = wallet.cookies;
+          walletDebug = wallet.debug;
+          if (wallet.balance != null) loginBalance = wallet.balance;
+        } catch {
+          // login succeeded even if wallet read fails
+        }
+        sessions.set(sessionId, { ...session, cookies, login_token: token, authenticated: true });
+        try {
+          writeFileSync(
+            "/Users/zj/Desktop/时时彩/.xy-wallet-last.json",
+            JSON.stringify({
+              at: new Date().toISOString(),
+              source: "xystep2",
+              loginKeys: Object.keys(loginResp.data),
+              payloadKeys: Object.keys(payload),
+              hasAccessToken: Boolean(token),
+              tokenLen: token.length,
+              result,
+              walletDebug,
+            }, null, 2)
+          );
+        } catch {
+          // ignore debug write
+        }
         return new Response(
-          JSON.stringify({ success: true, sessionId }),
+          JSON.stringify({ success: true, sessionId, balance: loginBalance }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
@@ -1175,109 +1591,298 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       );
     }
 
-    if (action === "xybet") {
-      const XY_BASE = "https://s.xybet00.com";
+    if (action === "xybalance") {
       const body = await req.json();
-      const { sessionId, lotteryId, issue, picks, betAmount, position } = body as {
+      const { sessionId } = body as { sessionId: string };
+      const session = sessions.get(sessionId);
+      if (!session || !session.authenticated) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话已过期，请重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const token = session.login_token ?? "";
+      if (!token) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话缺少登录令牌，请退出后重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      try {
+        const wallet = await xyFetchWalletAmount(session.cookies ?? "", token);
+        sessions.set(sessionId, { ...session, cookies: wallet.cookies });
+        try {
+          writeFileSync(
+            "/Users/zj/Desktop/时时彩/.xy-wallet-last.json",
+            JSON.stringify({
+              at: new Date().toISOString(),
+              source: "xybalance",
+              tokenLen: token.length,
+              ...wallet.debug,
+            }, null, 2)
+          );
+        } catch {
+          // ignore debug write
+        }
+        if (wallet.balance != null) {
+          return new Response(JSON.stringify({ balance: wallet.balance }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        const bodyPreview = wallet.debug.body.replace(/\s+/g, " ").slice(0, 180);
+        return new Response(
+          JSON.stringify({
+            error: `未能读取星亿娱乐账户余额（HTTP ${wallet.debug.status || "?"}，${bodyPreview || "响应为空"}）`,
+            debug: wallet.debug,
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({
+            error: "未能读取星亿娱乐账户余额",
+            debug: { body: err instanceof Error ? err.message : String(err) },
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    if (action === "xyissue") {
+      const body = await req.json();
+      const { sessionId, lotteryId: lotteryIdRaw } = body as { sessionId: string; lotteryId?: number };
+      const lotteryId = resolveLotteryId(lotteryIdRaw);
+      const session = sessions.get(sessionId);
+      if (!session || !session.authenticated) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话已过期，请重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const token = session.login_token ?? "";
+      if (!token) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐会话缺少登录令牌，请退出后重新登录" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const betReferer = `${XY_BASE}/Bet/${lotteryId}`;
+      try {
+        const issueInfoResp = await xyAuthorizedPost(
+          `/api/Bet/IssueInfo/${lotteryId}`,
+          {},
+          session.cookies ?? "",
+          token,
+          betReferer,
+        );
+        sessions.set(sessionId, { ...session, cookies: issueInfoResp.cookies });
+        const current = xyCurrentIssueInfo(issueInfoResp.data);
+        if (!current.serial) {
+          return new Response(
+            JSON.stringify({ error: "未能读取星亿娱乐当前期号" }),
+            { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            issue: hyphenIssue(current.serial),
+            closeAt: current.closeAt,
+          }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: err instanceof Error ? err.message : "读取星亿当前期号失败" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    if (action === "xybet") {
+      const body = await req.json();
+      const { sessionId, lotteryId: lotteryIdRaw, issue: issueRaw, picks, betAmount, position } = body as {
         sessionId: string; lotteryId: number; issue: string; picks: number[]; betAmount: number; position?: number;
       };
+      const lotteryId = resolveLotteryId(lotteryIdRaw);
+      let issue = issueRaw;
       const betPosition = position >= 1 && position <= 5 ? Math.round(position) : 5;
-      const numberParts = ["", "", "", "", ""];
-      numberParts[betPosition - 1] = "{pos}";
+      const betReferer = `${XY_BASE}/Bet/${lotteryId}`;
 
-      if (!sessionId || !lotteryId || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
+      if (!sessionId || !lotteryIdRaw || !issue || !Array.isArray(picks) || picks.length === 0 || !betAmount) {
         return new Response(
           JSON.stringify({ error: "参数不完整" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
       const session = sessions.get(sessionId);
-      if (!session) {
+      if (!session || !session.authenticated) {
         return new Response(
           JSON.stringify({ error: "星亿娱乐会话已过期，请重新登录" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      const cookies = session.cookies;
-      const betPageUrl = XY_BASE + "/Bet/Index?gid=" + lotteryId;
-      let betPageResp = await fetchWithCookies(betPageUrl, cookies, { redirect: "manual" });
-      let betPageCookies = betPageResp.cookies;
-      let betPageHtml = betPageResp.text;
-      for (let i = 0; i < 8; i++) {
-        if (betPageResp.status < 300 || betPageResp.status >= 400) break;
-        const location = betPageResp.headers.get("location");
-        if (!location) break;
-        const redirectUrl = location.startsWith("http") ? location : XY_BASE + (location.startsWith("/") ? location : "/" + location);
-        const next = await fetchWithCookies(redirectUrl, betPageCookies, { redirect: "manual" });
-        betPageCookies = next.cookies;
-        betPageHtml = next.text;
-        betPageResp = next;
-        break;
-      }
-      const isBetPageLogin = /ErrorHandle\/Timeout|top\.location\.href/i.test(betPageHtml);
-      if (isBetPageLogin) {
+      const token = session.login_token ?? "";
+      if (!token) {
         return new Response(
-          JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录" }),
-          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      const betFormToken = getFormField(betPageHtml, "__RequestVerificationToken");
-      const realGameId = lotteryId;
-      const gameInfoResp = await fetchWithCookies(XY_BASE + "/Bet/GameInfo", betPageCookies, {
-        method: "POST",
-        body: "lotteryGameId=" + realGameId,
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest", Referer: betPageUrl },
-      });
-      betPageCookies = gameInfoResp.cookies;
-      const betParamsResp = await fetchWithCookies(XY_BASE + "/Bet/GetBetParameters", betPageCookies, {
-        method: "POST",
-        body: "gameURLID=" + lotteryId,
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest", Referer: betPageUrl },
-      });
-      betPageCookies = betParamsResp.cookies;
-      sessions.set(sessionId, { ...session, cookies: betPageCookies });
-
-      const serialNumber = issue.replace("-", "");
-      const guid = generateBetGuid();
-      const unit = 2;
-      const multiple = Math.max(1, Math.round(betAmount / unit));
-      const betData = {
-        LotteryGameID: realGameId,
-        SerialNumber: serialNumber,
-        Bets: picks.map((n) => ({
-          BetTypeCode: 21, BetTypeName: "",
-          Number: numberParts.join(",").replace("{pos}", String(n)),
-          Position: String(betPosition),
-          Unit: unit, Multiple: multiple, ReturnRate: 0, IsCompressed: false, NoCommission: false,
-        })),
-        Schedules: [], StopIfWin: false, BetMode: 0, Guid: guid, IsLoginByWeChat: false,
-      };
-      const betResp = await fetchWithCookies(XY_BASE + "/Bet/Confirm?tgid=" + guid, betPageCookies, {
-        method: "POST",
-        body: JSON.stringify(betData),
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          "X-Requested-With": "XMLHttpRequest",
-          Referer: betPageUrl,
-          ...(betFormToken ? { "__RequestVerificationToken": betFormToken } : {}),
-        },
-      });
-      const isLoginRedirect = /ErrorHandle\/Timeout|top\.location\.href/i.test(betResp.text);
-      if (isLoginRedirect) {
-        return new Response(
-          JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录" }),
-          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      let betResult: unknown;
-      try { betResult = JSON.parse(betResp.text); } catch { betResult = { raw: betResp.text.slice(0, 500) }; }
-      const hasError = typeof betResult === "object" && betResult !== null && "ErrorMessage" in betResult && (betResult as { ErrorMessage: string }).ErrorMessage;
-      if (hasError) {
-        return new Response(
-          JSON.stringify({ error: (betResult as { ErrorMessage: string }).ErrorMessage }),
+          JSON.stringify({ error: "星亿娱乐会话缺少登录令牌，请退出后重新登录" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
+
+      let cookies = session.cookies ?? "";
+      try {
+        const gameInfoResp = await xyAuthorizedFetch(
+          `/api/Bet/GameInfo/${lotteryId}`,
+          cookies,
+          token,
+          { method: "GET", referer: betReferer },
+        );
+        cookies = gameInfoResp.cookies;
+        const issueInfoResp = await xyAuthorizedPost(
+          `/api/Bet/IssueInfo/${lotteryId}`,
+          {},
+          cookies,
+          token,
+          betReferer,
+        );
+        cookies = issueInfoResp.cookies;
+        const userGameResp = await xyAuthorizedPost(
+          `/api/Bet/UserGameInfo/${lotteryId}`,
+          {},
+          cookies,
+          token,
+          betReferer,
+        );
+        cookies = userGameResp.cookies;
+
+        const gameInfo = { ...gameInfoResp.data, ...xyPayload(gameInfoResp.data) };
+        if (gameInfo.Offline === true || gameInfo.IsOfficialOffline === true || gameInfo.IsMaintain === true) {
+          return new Response(
+            JSON.stringify({ error: `星亿娱乐该彩种当前不可投注（游戏 ${lotteryId}）` }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+
+        const currentIssue = xyCurrentIssueInfo(issueInfoResp.data);
+        if (currentIssue.serial) {
+          issue = hyphenIssue(currentIssue.serial);
+        } else if (issueInfoResp.status < 400 && !issueInfoResp.data.rawText) {
+          return new Response(
+            JSON.stringify({ error: "星亿娱乐该彩种当前暂停下注" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      } catch {
+        // 进厅失败时仍用前端传来的期号尝试投注
+      }
+
+      const xyDedupeKey = betDedupeKey(sessionId, lotteryId, issue);
+      if (
+        placingBetKeys.has(xyDedupeKey) ||
+        hasPendingBet(sessionId, lotteryId, issue) ||
+        hasPendingBet(sessionId, lotteryId, String(issueRaw))
+      ) {
+        return new Response(
+          JSON.stringify({ success: true, duplicate: true, lotteryId, issue }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      placingBetKeys.add(xyDedupeKey);
+      try {
+      const serialNumber = String(issue).replace(/-/g, "");
+      const guid = generateBetGuid();
+      const unit = 1;
+      const multiple = Math.max(1, Math.round(Number(betAmount) / unit));
+      const slotNumber = (digits: number[]) => {
+        const slots = ["", "", "", "", ""];
+        slots[betPosition - 1] = [...digits].sort((a, b) => a - b).join("");
+        return slots.join(",");
+      };
+      const betData = {
+        LotteryGameID: lotteryId,
+        SerialNumber: serialNumber,
+        IsLoginByWeChat: false,
+        Guid: guid,
+        BetMode: 0,
+        BetGuid: "",
+        LionKingBetID: 0,
+        Bets: [{
+          BetTypeCode: 21,
+          Number: slotNumber(picks.map((n) => Number(n))),
+          IsCompressed: false,
+          Position: String(betPosition),
+          Unit: unit,
+          Multiple: multiple,
+          ReturnRate: 0,
+        }],
+      };
+
+      let betResp;
+      try {
+        betResp = await xyAuthorizedPost("/api/Bet/Confirm", betData, cookies, token, betReferer);
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: err instanceof Error ? err.message : "星亿娱乐投注请求失败" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      sessions.set(sessionId, { ...session, cookies: betResp.cookies });
+      cookies = betResp.cookies;
+
+      const firstError = typeof betResp.data.ErrorMessage === "string" ? betResp.data.ErrorMessage : "";
+      if (betResp.data.Success !== true && /非当前期号|已关盘|关盘/.test(firstError)) {
+        try {
+          const refresh = await xyAuthorizedPost(`/api/Bet/IssueInfo/${lotteryId}`, {}, cookies, token, betReferer);
+          cookies = refresh.cookies;
+          const fresh = xyCurrentIssueInfo(refresh.data);
+          if (fresh.serial && !issuesMatch(fresh.serial, String(issue))) {
+            issue = hyphenIssue(fresh.serial);
+            betData.SerialNumber = String(issue).replace(/-/g, "");
+            betResp = await xyAuthorizedPost("/api/Bet/Confirm", betData, cookies, token, betReferer);
+            sessions.set(sessionId, { ...session, cookies: betResp.cookies });
+          }
+        } catch {
+          // keep original confirm result
+        }
+      }
+
+      if (betResp.status === 401 || betResp.status === 403) {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐登录已过期，请重新登录" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      if (typeof betResp.data.rawText === "string") {
+        return new Response(
+          JSON.stringify({ error: "星亿娱乐投注接口返回异常，请稍后重试" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const success = betResp.data.Success === true;
+      const errorMessage = typeof betResp.data.ErrorMessage === "string" ? betResp.data.ErrorMessage : "";
+      if (!success) {
+        return new Response(
+          JSON.stringify({ error: errorMessage || `星亿娱乐投注失败（HTTP ${betResp.status}）` }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const remoteSource = betResp.data.Bets ?? xyPayload(betResp.data).Bets;
+      const remote_ids: string[] = [];
+      if (Array.isArray(remoteSource)) {
+        for (const item of remoteSource) {
+          if (!item || typeof item !== "object") continue;
+          const rec = item as Record<string, unknown>;
+          for (const key of ["ID", "Id", "id", "BetID"]) {
+            const value = rec[key];
+            if (typeof value === "string" && value) remote_ids.push(value);
+            else if (typeof value === "number" && Number.isFinite(value)) remote_ids.push(String(value));
+          }
+        }
+      }
+
       const betId = crypto.randomUUID();
       const totalCost = betAmount * picks.length;
       const bet: BetRow = {
@@ -1285,11 +1890,43 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         bet_amount: betAmount, total_cost: totalCost, status: "pending",
         result_number: null, payout: 0, net: 0, position: betPosition,
         created_at: new Date().toISOString(), settled_at: null,
+        remote_ids: [...new Set(remote_ids)],
       };
       if (!bets.has(sessionId)) bets.set(sessionId, []);
       bets.get(sessionId)!.push(bet);
+      upsertBet(bet);
       return new Response(
-        JSON.stringify({ success: true, betId, betResult }),
+        JSON.stringify({ success: true, betId, lotteryId, issue, walletAmount: betResp.data.WalletAmount }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+      } finally {
+        placingBetKeys.delete(xyDedupeKey);
+      }
+    }
+
+    if (action === "betdays") {
+      return new Response(
+        JSON.stringify({
+          days: dailySummary(),
+          rebatePerTurnover: 10000,
+          rebateAmount: 475,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "betdays-clear") {
+      const body = await req.json().catch(() => ({})) as { password?: string };
+      if (String(body.password ?? "") !== "138654") {
+        return new Response(
+          JSON.stringify({ error: "密码错误，无法清空" }),
+          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      bets.clear();
+      clearLedger();
+      return new Response(
+        JSON.stringify({ success: true, days: [] }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -1311,3 +1948,16 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     );
   }
 }
+
+setProxyCall(async (action, body) => {
+  const resp = await handleLotteryProxy(
+    new Request(`http://127.0.0.1/api/lottery?action=${encodeURIComponent(action)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    }),
+  );
+  const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+  return { status: resp.status, data };
+});
+

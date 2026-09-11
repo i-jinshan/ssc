@@ -24,7 +24,9 @@ dist-ssr
 .env.*
 !.env.example
 
+data/
 debug_resp.json
+.xy-wallet-last.json
 script_hits.txt
 .bolt/
 

@@ -1,7 +1,7 @@
-import { useState, useCallback, useEffect } from 'react';
-import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft } from 'lucide-react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
+import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft, Wallet, CalendarDays, ChevronDown, ChevronUp } from 'lucide-react';
 import { API_URL, API_HEADERS } from '@/api';
-import { NumberBall, ballColor } from '@/App';
+import { NumberBall, ballColor, compareBetHistory, nextMartingaleState, stakeWithMultiplier } from '@/App';
 
 export interface BetRow {
   id: string;
@@ -18,6 +18,7 @@ export interface BetRow {
   created_at: string;
   settled_at: string | null;
   position: number;
+  remote_ids?: string[];
 }
 
 export type BetPlatform = 'aoshi' | 'xingyi';
@@ -35,6 +36,11 @@ interface AutoBetPanelProps {
   positionLabel: string;
   onPlaceBet: () => void;
   placingBet: boolean;
+  scheduledBetAt: number | null;
+  autoBetError?: string;
+  martingaleOn: boolean;
+  martingaleFactor: number;
+  martingaleReset: number;
   platform: BetPlatform;
   onPlatformChange: (platform: BetPlatform) => void;
   xySessionId: string | null;
@@ -55,6 +61,11 @@ export function AutoBetPanel({
   positionLabel,
   onPlaceBet,
   placingBet,
+  scheduledBetAt,
+  autoBetError,
+  martingaleOn,
+  martingaleFactor,
+  martingaleReset,
   platform,
   onPlatformChange,
   xySessionId,
@@ -64,49 +75,185 @@ export function AutoBetPanel({
   const [bets, setBets] = useState<BetRow[]>([]);
   const [loadingBets, setLoadingBets] = useState(false);
   const [showXyLogin, setShowXyLogin] = useState(false);
+  const [xyBalance, setXyBalance] = useState<number | null>(null);
+  const [xyBalanceError, setXyBalanceError] = useState('');
+  const [loadingBalance, setLoadingBalance] = useState(false);
+  const [cancelError, setCancelError] = useState('');
+  const [daysOpen, setDaysOpen] = useState(false);
+  const [showClearDays, setShowClearDays] = useState(false);
+  const [clearPassword, setClearPassword] = useState('');
+  const [clearError, setClearError] = useState('');
+  const [clearingDays, setClearingDays] = useState(false);
+  const [days, setDays] = useState<Array<{
+    date: string;
+    dateLabel: string;
+    turnover: number;
+    net: number;
+    rebate: number;
+    wins: number;
+    losses: number;
+    pending: number;
+    winRate: number | null;
+  }>>([]);
+
+  const bettingSessionId = platform === 'xingyi' ? xySessionId : sessionId;
+
+  const fetchDays = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}?action=betdays`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: '{}',
+      });
+      if (!resp.ok) return;
+      const data = await resp.json() as { days?: typeof days };
+      if (Array.isArray(data.days)) setDays(data.days);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const clearHistory = useCallback(async () => {
+    if (clearingDays) return;
+    setClearingDays(true);
+    setClearError('');
+    try {
+      const resp = await fetch(`${API_URL}?action=betdays-clear`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ password: clearPassword }),
+      });
+      const data = await resp.json() as { success?: boolean; error?: string };
+      if (!resp.ok || data.error) {
+        setClearError(data.error || '密码错误，无法清空');
+        return;
+      }
+      setDays([]);
+      setBets([]);
+      setShowClearDays(false);
+      setClearPassword('');
+    } catch {
+      setClearError('清空失败，请检查本地服务');
+    } finally {
+      setClearingDays(false);
+    }
+  }, [clearPassword, clearingDays]);
 
   const fetchBets = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId && !bettingSessionId) return;
     setLoadingBets(true);
     try {
       const resp = await fetch(`${API_URL}?action=betlist`, {
         method: 'POST',
         headers: API_HEADERS,
-        body: JSON.stringify({ sessionId, lotteryId: gameId }),
+        body: JSON.stringify({ sessionId: bettingSessionId || sessionId, lotteryId: gameId }),
       });
       if (!resp.ok) return;
       const data = await resp.json();
       if (Array.isArray(data.bets)) {
         setBets(data.bets);
       }
+      void fetchDays();
     } catch {
       // ignore
     } finally {
       setLoadingBets(false);
     }
-  }, [sessionId, gameId]);
+  }, [bettingSessionId, sessionId, gameId, fetchDays]);
 
   useEffect(() => {
     fetchBets();
-  }, [fetchBets]);
+    fetchDays();
+  }, [fetchBets, fetchDays]);
+
+  useEffect(() => {
+    if (!bettingSessionId || draws.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await fetch(`${API_URL}?action=betsettle`, {
+          method: 'POST',
+          headers: API_HEADERS,
+          body: JSON.stringify({
+            sessionId: bettingSessionId,
+            draws: draws.map((d) => ({ issue: d.issue, numbers: d.numbers })),
+          }),
+        });
+      } catch {
+        // ignore
+      }
+      if (!cancelled) fetchBets();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bettingSessionId, draws, fetchBets]);
 
   useEffect(() => {
     const interval = setInterval(fetchBets, 10000);
     return () => clearInterval(interval);
   }, [fetchBets]);
 
-  const deleteBet = useCallback(async (betId: string) => {
+  useEffect(() => {
+    if (!placingBet) fetchBets();
+  }, [placingBet, fetchBets]);
+
+  const fetchXyBalance = useCallback(async () => {
+    if (platform !== 'xingyi' || !xySessionId) {
+      setXyBalance(null);
+      setXyBalanceError('');
+      return;
+    }
+    setLoadingBalance(true);
     try {
-      await fetch(`${API_URL}?action=betdelete`, {
+      const resp = await fetch(`${API_URL}?action=xybalance`, {
         method: 'POST',
         headers: API_HEADERS,
-        body: JSON.stringify({ betId }),
+        body: JSON.stringify({ sessionId: xySessionId }),
       });
-      fetchBets();
+      const data = await resp.json();
+      if (typeof data.balance === 'number' && Number.isFinite(data.balance)) {
+        setXyBalance(data.balance);
+        setXyBalanceError('');
+      } else {
+        setXyBalance(null);
+        setXyBalanceError(data.error || '未能读取余额');
+      }
     } catch {
-      // ignore
+      setXyBalance(null);
+      setXyBalanceError('读取余额失败');
+    } finally {
+      setLoadingBalance(false);
     }
-  }, [fetchBets]);
+  }, [platform, xySessionId]);
+
+  useEffect(() => {
+    fetchXyBalance();
+    if (platform !== 'xingyi' || !xySessionId) return;
+    const interval = setInterval(fetchXyBalance, 30000);
+    return () => clearInterval(interval);
+  }, [fetchXyBalance, platform, xySessionId]);
+
+  const deleteBet = useCallback(async (betId: string) => {
+    if (!bettingSessionId) return;
+    setCancelError('');
+    try {
+      const resp = await fetch(`${API_URL}?action=betdelete`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ betId, sessionId: bettingSessionId }),
+      });
+      const data = await resp.json() as { success?: boolean; error?: string };
+      if (!resp.ok || data.error) {
+        setCancelError(data.error || '撤单失败');
+        return;
+      }
+      fetchBets();
+      if (platform === 'xingyi') fetchXyBalance();
+    } catch {
+      setCancelError('撤单请求失败，请检查网络连接');
+    }
+  }, [bettingSessionId, fetchBets, fetchXyBalance, platform]);
 
   const pendingBets = bets.filter((b) => b.status === 'pending');
   const wonBets = bets.filter((b) => b.status === 'won');
@@ -117,6 +264,16 @@ export function AutoBetPanel({
   const winRate = bets.length > 0 && (wonBets.length + lostBets.length) > 0
     ? `${Math.round((wonBets.length / (wonBets.length + lostBets.length)) * 100)}%`
     : '—';
+
+  const martingale = useMemo(() => {
+    const results = [...bets]
+      .filter((bet) => bet.status === 'won' || bet.status === 'lost')
+      .sort(compareBetHistory)
+      .map((bet) => bet.status as 'won' | 'lost');
+    return nextMartingaleState(results, martingaleOn, martingaleFactor, martingaleReset);
+  }, [bets, martingaleOn, martingaleFactor, martingaleReset]);
+  const stakePerNumber = stakeWithMultiplier(betAmount, martingale.multiplier);
+  const stakeTotal = stakePerNumber * nextPicks.length;
 
   const needsXyLogin = platform === 'xingyi' && !xySessionId;
 
@@ -172,6 +329,12 @@ export function AutoBetPanel({
             </button>
           </div>
           {platform === 'xingyi' && (
+            <p className="mt-2 text-xs text-slate-500">
+              当前投注星亿 {gameId === 60 ? '腾讯分分彩' : gameId === 127 ? '腾讯5分彩' : '腾讯10分彩'}
+              （s.xybet00.com/Bet/{gameId}）
+            </p>
+          )}
+          {platform === 'xingyi' && (
             <div className="mt-3 flex items-center gap-3">
               {xySessionId ? (
                 <div className="flex items-center gap-2">
@@ -215,7 +378,7 @@ export function AutoBetPanel({
                 />
               </button>
               <span className={`text-sm font-medium ${autoBetOn ? 'text-emerald-600' : 'text-slate-400'}`}>
-                {autoBetOn ? '已开启' : '已关闭'}
+                {autoBetOn ? '已开启（后台运行）' : '已关闭'}
               </span>
             </label>
 
@@ -247,6 +410,17 @@ export function AutoBetPanel({
           </button>
         </div>
 
+        {autoBetOn && (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            自动投注在本机服务里运行，关掉网页也会继续下。关机、休眠，或关掉跑项目的终端（npm run dev / npm start）后会停止。下次在本页关掉开关即可停止。
+          </p>
+        )}
+        {autoBetError && autoBetOn && (
+          <div className="mt-3 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            <AlertCircle className="h-4 w-4 flex-shrink-0" />
+            <span>{autoBetError}</span>
+          </div>
+        )}
         {needsXyLogin && autoBetOn && (
           <div className="mt-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
             <AlertCircle className="h-4 w-4 flex-shrink-0" />
@@ -263,8 +437,12 @@ export function AutoBetPanel({
                   下一期{positionLabel}自动投注: {nextIssue}
                 </p>
                 <p className="mt-1 text-xs text-amber-600">
-                  {nextPicks.length} 码 · 每码 ¥{betAmount} · 共需 ¥{betAmount * nextPicks.length}
+                  {nextPicks.length} 码 · 每码 ¥{stakePerNumber}
+                  {martingaleOn ? ` · ${martingale.multiplier}倍` : ''}
+                  · 共需 ¥{stakeTotal}
+                  {martingaleOn ? ` · 连不中 ${martingale.lossStreak}/${martingaleReset}` : ''}
                   {platform === 'xingyi' ? ' · 星亿娱乐' : ' · 傲世皇朝'}
+                  {placingBet ? ' · 正在提交投注…' : scheduledBetAt ? ` · 随机等待至 ${new Date(scheduledBetAt).toLocaleTimeString('zh-CN', { hour12: false })} 再投` : ''}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -276,6 +454,33 @@ export function AutoBetPanel({
           </div>
         )}
       </div>
+
+      {platform === 'xingyi' && xySessionId && (
+        <div className="flex items-center justify-between rounded-2xl border border-emerald-200 bg-white px-5 py-4 shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600">
+              <Wallet className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wider text-slate-400">星亿娱乐账户余额</p>
+              <p className="mt-1 text-2xl font-bold text-slate-900">
+                {xyBalance == null ? '—' : `¥${xyBalance.toFixed(3)}`}
+              </p>
+              {xyBalanceError && (
+                <p className="mt-0.5 text-xs text-rose-500">{xyBalanceError}</p>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={fetchXyBalance}
+            disabled={loadingBalance}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loadingBalance ? 'animate-spin' : ''}`} />
+            刷新余额
+          </button>
+        </div>
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -309,6 +514,131 @@ export function AutoBetPanel({
         </div>
       </div>
 
+      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div className={`flex items-center justify-between px-5 py-3 ${daysOpen ? 'border-b border-slate-100' : ''}`}>
+          <div className="flex items-center gap-2">
+            <CalendarDays className="h-4 w-4 text-sky-500" />
+            <h3 className="text-sm font-semibold text-slate-700">每日投注汇总</h3>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setShowClearDays(true);
+                setClearPassword('');
+                setClearError('');
+              }}
+              className="rounded-lg border border-rose-200 px-2.5 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
+            >
+              清空历史数据
+            </button>
+            <button
+              type="button"
+              onClick={() => setDaysOpen((open) => !open)}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+              aria-label={daysOpen ? '收起每日汇总' : '展开每日汇总'}
+            >
+              {daysOpen ? <ChevronUp className="h-5 w-5" /> : <ChevronDown className="h-5 w-5" />}
+            </button>
+          </div>
+        </div>
+        {daysOpen && (
+          <div className="max-h-[360px] overflow-auto">
+            <p className="px-5 pt-3 text-xs text-slate-400">北京时间 · 流水每万返 475 · 关机后仍保留</p>
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 z-10 bg-slate-50">
+                <tr className="text-left text-slate-600">
+                  <th className="px-4 py-3 font-semibold">日期</th>
+                  <th className="px-4 py-3 font-semibold text-right">总投注量</th>
+                  <th className="px-4 py-3 font-semibold text-right">输赢</th>
+                  <th className="px-4 py-3 font-semibold text-right">流水奖励</th>
+                  <th className="px-4 py-3 font-semibold text-right">含奖励</th>
+                  <th className="px-4 py-3 font-semibold text-right">胜率</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {days.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-10 text-center text-slate-400">
+                      暂无每日汇总，投注成功后会写入本地记录
+                    </td>
+                  </tr>
+                ) : (
+                  days.map((row) => {
+                    const withRebate = row.net + row.rebate;
+                    return (
+                      <tr key={row.date} className="transition hover:bg-sky-50/60">
+                        <td className="px-4 py-3 font-medium text-slate-800">{row.dateLabel}</td>
+                        <td className="px-4 py-3 text-right tabular-nums text-slate-700">¥{row.turnover.toFixed(2)}</td>
+                        <td className={`px-4 py-3 text-right tabular-nums font-medium ${row.net >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          {row.net >= 0 ? '+' : ''}¥{row.net.toFixed(2)}
+                        </td>
+                        <td className="px-4 py-3 text-right tabular-nums text-amber-600">+¥{row.rebate.toFixed(2)}</td>
+                        <td className={`px-4 py-3 text-right tabular-nums font-medium ${withRebate >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          {withRebate >= 0 ? '+' : ''}¥{withRebate.toFixed(2)}
+                        </td>
+                        <td className="px-4 py-3 text-right text-slate-700">
+                          {row.winRate == null ? '—' : `${Math.round(row.winRate * 1000) / 10}%`}
+                          <span className="ml-1 text-xs text-slate-400">
+                            {row.wins}/{row.wins + row.losses}
+                            {row.pending > 0 ? ` · 待开${row.pending}` : ''}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {showClearDays && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-xl">
+            <h3 className="text-base font-semibold text-slate-900">清空历史数据</h3>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              将删除本机保存的每日汇总和投注记录，且不可恢复。请输入密码确认。
+            </p>
+            <input
+              type="password"
+              value={clearPassword}
+              onChange={(e) => setClearPassword(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void clearHistory();
+              }}
+              placeholder="请输入密码"
+              className="mt-4 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-800 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+            />
+            {clearError && (
+              <p className="mt-2 text-sm text-rose-600">{clearError}</p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowClearDays(false);
+                  setClearPassword('');
+                  setClearError('');
+                }}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void clearHistory()}
+                disabled={clearingDays || !clearPassword}
+                className="rounded-xl bg-rose-500 px-4 py-2 text-sm font-medium text-white hover:bg-rose-600 disabled:opacity-50"
+              >
+                {clearingDays ? '清空中…' : '确认清空'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Bet history table */}
       <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
@@ -321,6 +651,12 @@ export function AutoBetPanel({
             {loadingBets ? '刷新中…' : '刷新'}
           </button>
         </div>
+        {cancelError && (
+          <div className="mx-5 mt-3 mb-1 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-600">
+            <AlertCircle className="h-4 w-4 flex-shrink-0" />
+            <span>{cancelError}</span>
+          </div>
+        )}
         <div className="max-h-[500px] overflow-auto">
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10 bg-slate-50 backdrop-blur">

@@ -11,6 +11,13 @@ const LOTTERY_BASE = "https://sk.jhc3ejo8.com";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+function issueKeys(issue: string): string[] {
+  const raw = String(issue ?? "");
+  const compact = raw.replace(/-/g, "");
+  const hyphen = compact.length > 8 ? `${compact.slice(0, 8)}-${compact.slice(8)}` : raw;
+  return [...new Set([raw, compact, hyphen].filter(Boolean))];
+}
+
 interface SessionRow {
   id: string;
   cookies: string;
@@ -1093,25 +1100,25 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      const ODDS = 9.77;
+      const ODDS = 9.49;
       let settledCount = 0;
 
       for (const draw of draws) {
-        const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
-        const issueKey = draw.issue.includes("-")
-          ? draw.issue
-          : draw.issue.slice(0, 8) + "-" + draw.issue.slice(8);
+        if (!Array.isArray(draw.numbers) || draw.numbers.length < 1) continue;
+        const keys = issueKeys(draw.issue);
+        const orFilter = keys.map((k) => `issue.eq.${k}`).join(",");
 
         const { data: pendingBets } = await supabase
           .from("lottery_bets")
           .select("*")
           .eq("session_id", sessionId)
           .eq("status", "pending")
-          .or(`issue.eq.${draw.issue},issue.eq.${issueKey}`);
+          .or(orFilter);
 
         if (!pendingBets || pendingBets.length === 0) continue;
 
         for (const bet of pendingBets) {
+          const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
           const hit = bet.picks.includes(resultNumber);
           const payout = hit ? Number(bet.bet_amount) * ODDS : 0;
           const net = payout - Number(bet.total_cost);
