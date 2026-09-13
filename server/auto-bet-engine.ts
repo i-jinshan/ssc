@@ -38,6 +38,7 @@ type Job = AutoBetConfig & {
   lastError: string;
   lastPicks: number[];
   placing: boolean;
+  failStreak: number;
 };
 
 type ProxyCall = (action: string, body: unknown) => Promise<{ status: number; data: Record<string, unknown> }>;
@@ -310,6 +311,7 @@ function startJob(config: AutoBetConfig) {
     lastError: "",
     lastPicks: prev?.lastPicks ?? [],
     placing: prev?.placing ?? false,
+    failStreak: 0,
   });
   persistJobs();
   ensureTimer();
@@ -324,6 +326,7 @@ function stopJob(memberId?: string) {
       job.scheduledAt = null;
       job.scheduledIssue = null;
       job.placing = false;
+      job.failStreak = 0;
     }
   } else {
     for (const job of s.jobs.values()) {
@@ -331,6 +334,7 @@ function stopJob(memberId?: string) {
       job.scheduledAt = null;
       job.scheduledIssue = null;
       job.placing = false;
+      job.failStreak = 0;
     }
   }
   persistJobs();
@@ -342,10 +346,15 @@ export function stopJobForMember(memberId: string) {
   persistJobs();
 }
 
-async function handleJobAuthFailure(job: Job, status: number, error: string) {
+async function handleJobAuthFailure(job: Job, status: number, error: string, opts?: { countFail?: boolean }) {
   job.lastError = error;
-  if (!isLoginExpiredError(status, error)) return;
-  await alertMemberLoginExpired(job.memberId, job.platform, error);
+  if (opts?.countFail) job.failStreak = (job.failStreak ?? 0) + 1;
+  const expired = isLoginExpiredError(status, error) || (job.failStreak ?? 0) >= 8;
+  if (!expired) return;
+  if ((job.failStreak ?? 0) >= 8 && !isLoginExpiredError(status, error)) {
+    job.lastError = `${error}（连续失败，已停止自动投注）`;
+  }
+  await alertMemberLoginExpired(job.memberId, job.platform, job.lastError);
   stopJob(job.memberId);
 }
 
@@ -376,7 +385,7 @@ async function tickJob(job: Job) {
       closeAt = typeof issueResp.data.closeAt === "number" ? issueResp.data.closeAt : null;
       if (!liveIssue) {
         const err = String(issueResp.data.error ?? "未能读取当前期号");
-        await handleJobAuthFailure(job, issueResp.status, err);
+        await handleJobAuthFailure(job, issueResp.status, err, { countFail: true });
         return;
       }
     }
@@ -385,7 +394,7 @@ async function tickJob(job: Job) {
     const draws = Array.isArray(drawsResp.data.draws) ? (drawsResp.data.draws as Draw[]) : [];
     if (draws.length === 0) {
       const err = String(drawsResp.data.error ?? "未获取到开奖数据");
-      await handleJobAuthFailure(job, drawsResp.status, err);
+      await handleJobAuthFailure(job, drawsResp.status, err, { countFail: true });
       return;
     }
 
@@ -401,6 +410,7 @@ async function tickJob(job: Job) {
     }
     job.liveIssue = liveIssue;
     job.closeAt = closeAt;
+    job.failStreak = 0;
     if (!liveIssue) return;
     if (sameIssue(liveIssue, job.lastBetIssue)) return;
 
@@ -466,7 +476,7 @@ async function tickJob(job: Job) {
         persistJobs();
       } else {
         job.lastError = String(betResp.data.error ?? `投注失败（HTTP ${betResp.status}）`);
-        await handleJobAuthFailure(job, betResp.status, job.lastError);
+        await handleJobAuthFailure(job, betResp.status, job.lastError, { countFail: true });
       }
     } finally {
       job.placing = false;
@@ -474,7 +484,7 @@ async function tickJob(job: Job) {
   } catch (err) {
     job.placing = false;
     job.lastError = err instanceof Error ? err.message : "自动投注异常";
-    await handleJobAuthFailure(job, 0, job.lastError);
+    await handleJobAuthFailure(job, 0, job.lastError, { countFail: true });
   }
 }
 

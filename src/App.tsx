@@ -261,6 +261,10 @@ function persistAutoBetOn(value: boolean) {
   }
 }
 
+function isAutoBetAuthStopError(error: string): boolean {
+  return /登录已过期|会话已过期|请重新登录|请刷新验证码|缺少登录令牌|连续失败，已停止自动投注/.test(error);
+}
+
 function readStoredBetAmount(): number {
   try {
     const raw = localStorage.getItem(BET_AMOUNT_KEY);
@@ -1568,6 +1572,10 @@ function App() {
         if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
         else setScheduledBetAt(null);
         setAutoBetServerError(data.lastError || '');
+        if (data.running === false && isAutoBetAuthStopError(data.lastError || '')) {
+          persistAutoBetOn(false);
+          setAutoBetOn(false);
+        }
         if (typeof data.lastBetIssue === 'string' && data.lastBetIssue) {
           lastBetIssueRef.current = data.lastBetIssue;
           setLastBetIssue(data.lastBetIssue);
