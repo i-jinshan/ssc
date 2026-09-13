@@ -1434,19 +1434,49 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       }
 
       const drawMap = new Map<string, number[]>();
+      const latestByDay = new Map<string, number>();
       for (const draw of draws) {
         const digits = drawDigits(draw.numbers);
         const parts = issueParts(draw.issue);
         if (!digits || !parts) continue;
         drawMap.set(`${parts.day}-${parts.seq}`, digits);
+        latestByDay.set(parts.day, Math.max(latestByDay.get(parts.day) ?? 0, parts.seq));
       }
+      const newestDay = [...latestByDay.keys()].sort().at(-1) ?? "";
+
+      const persistBet = (bet: BetRow) => {
+        upsertBet(bet);
+        const memoryList = bets.get(bet.session_id);
+        if (memoryList) {
+          const index = memoryList.findIndex((item) => item.id === bet.id);
+          if (index >= 0) memoryList[index] = bet;
+          else memoryList.push(bet);
+        }
+      };
 
       for (const bet of pool) {
         if (bet.status !== "pending" && bet.status !== "won" && bet.status !== "lost") continue;
         const parts = issueParts(bet.issue);
         if (!parts) continue;
         const digits = drawMap.get(`${parts.day}-${parts.seq}`);
-        if (!digits) continue;
+        if (!digits) {
+          const latest = latestByDay.get(parts.day) ?? 0;
+          if (
+            filterLottery &&
+            (bet.status === "won" || bet.status === "lost") &&
+            parts.day === newestDay &&
+            parts.seq > latest
+          ) {
+            bet.status = "pending";
+            bet.result_number = null;
+            bet.payout = 0;
+            bet.net = 0;
+            bet.settled_at = null;
+            settledCount++;
+            persistBet(bet);
+          }
+          continue;
+        }
         const pos = bet.position >= 1 && bet.position <= 5 ? bet.position : 5;
         const resultNumber = digits[pos - 1];
         if (typeof resultNumber !== "number") continue;
@@ -1467,13 +1497,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         bet.net = net;
         bet.settled_at = new Date().toISOString();
         settledCount++;
-        upsertBet(bet);
-        const memoryList = bets.get(bet.session_id);
-        if (memoryList) {
-          const index = memoryList.findIndex((item) => item.id === bet.id);
-          if (index >= 0) memoryList[index] = bet;
-          else memoryList.push(bet);
-        }
+        persistBet(bet);
       }
       if (settledCount > 0) persistLedgerNow();
 
