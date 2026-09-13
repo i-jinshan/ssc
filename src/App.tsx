@@ -1390,6 +1390,8 @@ function App() {
       xyLiveIssueRef.current = null;
       return;
     }
+    setXyLiveIssue(null);
+    xyLiveIssueRef.current = null;
     let cancelled = false;
     const pull = async () => {
       try {
@@ -1569,6 +1571,7 @@ function App() {
           lastBetIssue?: string | null;
           issue?: string | null;
           closeAt?: number | null;
+          lotteryId?: number;
         };
         if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
         else setScheduledBetAt(null);
@@ -1581,7 +1584,11 @@ function App() {
           lastBetIssueRef.current = data.lastBetIssue;
           setLastBetIssue(data.lastBetIssue);
         }
-        if (typeof data.issue === 'string' && data.issue) {
+        if (
+          typeof data.issue === 'string' &&
+          data.issue &&
+          (data.lotteryId == null || data.lotteryId === gameId)
+        ) {
           const next = { issue: data.issue, closeAt: typeof data.closeAt === 'number' ? data.closeAt : null };
           xyLiveIssueRef.current = next;
           setXyLiveIssue(next);
@@ -1593,7 +1600,7 @@ function App() {
     void pull();
     const timer = window.setInterval(pull, 2000);
     return () => window.clearInterval(timer);
-  }, [autoBetOn, memberId, sessionId]);
+  }, [autoBetOn, memberId, sessionId, gameId]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
