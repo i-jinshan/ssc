@@ -111,6 +111,21 @@ interface BetRow {
 
 const sessions = new Map<string, SessionRow>();
 const bets = new Map<string, BetRow[]>();
+const xyWalletCache = new Map<string, { balance: number; at: number }>();
+const xyIssueCache = new Map<string, { issue: string; closeAt: number | null; at: number }>();
+const XY_WALLET_TTL_MS = 20_000;
+const XY_ISSUE_TTL_MS = 3_000;
+
+function isRateLimited(status: number, body = ""): boolean {
+  return status === 429 || /too many requests/i.test(body);
+}
+
+function xyPublicError(status: number, body = ""): string {
+  if (isRateLimited(status, body)) return "星亿请求过于频繁，请稍后再试";
+  if (/<html/i.test(body)) return "星亿接口暂时不可用，请稍后重试";
+  const compact = body.replace(/\s+/g, " ").trim().slice(0, 80);
+  return compact || "星亿接口请求失败";
+}
 
 for (const bet of loadLedger()) {
   if (!bets.has(bet.session_id)) bets.set(bet.session_id, []);
@@ -1819,6 +1834,9 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
             body: text.slice(0, 1500),
             tokenLen: token.length,
           };
+          if (isRateLimited(resp.status, text)) {
+            return { balance: null, cookies, debug };
+          }
           let parsed: unknown = text;
           try { parsed = JSON.parse(text); } catch { parsed = text; }
           const balance = pickNumericBalance(parsed);
@@ -2090,7 +2108,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     if (action === "xybalance") {
       const body = await req.json();
-      const { sessionId } = body as { sessionId: string };
+      const { sessionId, force } = body as { sessionId: string; force?: boolean };
       const session = sessions.get(sessionId);
       if (!session || !session.authenticated) {
         return new Response(
@@ -2106,40 +2124,42 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
+      const cached = xyWalletCache.get(sessionId);
+      if (!force && cached && Date.now() - cached.at < XY_WALLET_TTL_MS) {
+        return new Response(JSON.stringify({ balance: cached.balance, cached: true }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       try {
         const wallet = await xyFetchWalletAmount(session.cookies ?? "", token);
         sessions.set(sessionId, { ...session, cookies: wallet.cookies });
-        try {
-          writeFileSync(
-            "/Users/zj/Desktop/时时彩/.xy-wallet-last.json",
-            JSON.stringify({
-              at: new Date().toISOString(),
-              source: "xybalance",
-              tokenLen: token.length,
-              ...wallet.debug,
-            }, null, 2)
-          );
-        } catch {
-          // ignore debug write
-        }
         if (wallet.balance != null) {
+          xyWalletCache.set(sessionId, { balance: wallet.balance, at: Date.now() });
           return new Response(JSON.stringify({ balance: wallet.balance }), {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           });
         }
-        const bodyPreview = wallet.debug.body.replace(/\s+/g, " ").slice(0, 180);
+        if (cached && isRateLimited(wallet.debug.status, wallet.debug.body)) {
+          return new Response(JSON.stringify({ balance: cached.balance, cached: true }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
         return new Response(
           JSON.stringify({
-            error: `未能读取星亿娱乐账户余额（HTTP ${wallet.debug.status || "?"}，${bodyPreview || "响应为空"}）`,
-            debug: wallet.debug,
+            error: xyPublicError(wallet.debug.status, wallet.debug.body),
           }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          { status: isRateLimited(wallet.debug.status, wallet.debug.body) ? 429 : 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       } catch (err) {
+        if (cached) {
+          return new Response(JSON.stringify({ balance: cached.balance, cached: true }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
         return new Response(
           JSON.stringify({
-            error: "未能读取星亿娱乐账户余额",
-            debug: { body: err instanceof Error ? err.message : String(err) },
+            error: err instanceof Error ? err.message : "未能读取星亿娱乐账户余额",
           }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
@@ -2165,6 +2185,14 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
       const betReferer = `${XY_BASE}/Bet/${lotteryId}`;
+      const issueCacheKey = `${sessionId}:${lotteryId}`;
+      const cachedIssue = xyIssueCache.get(issueCacheKey);
+      if (cachedIssue && Date.now() - cachedIssue.at < XY_ISSUE_TTL_MS) {
+        return new Response(
+          JSON.stringify({ issue: cachedIssue.issue, closeAt: cachedIssue.closeAt, cached: true }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
       try {
         let tokenNow = token;
         let cookiesNow = session.cookies ?? "";
@@ -2175,6 +2203,18 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           tokenNow,
           betReferer,
         );
+        if (isRateLimited(issueInfoResp.status, JSON.stringify(issueInfoResp.data))) {
+          if (cachedIssue) {
+            return new Response(
+              JSON.stringify({ issue: cachedIssue.issue, closeAt: cachedIssue.closeAt, cached: true }),
+              { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+          return new Response(
+            JSON.stringify({ error: xyPublicError(issueInfoResp.status) }),
+            { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
         if (issueInfoResp.status === 401 || issueInfoResp.status === 403) {
           const refreshed = await xyRefreshAccessToken(cookiesNow, tokenNow);
           if (refreshed) {
@@ -2192,21 +2232,39 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         xyMergeSessionToken(sessionId, session, issueInfoResp.cookies, issueInfoResp.data, tokenNow);
         const current = xyCurrentIssueInfo(issueInfoResp.data);
         if (!current.serial) {
+          if (cachedIssue && isRateLimited(issueInfoResp.status, JSON.stringify(issueInfoResp.data))) {
+            return new Response(
+              JSON.stringify({ issue: cachedIssue.issue, closeAt: cachedIssue.closeAt, cached: true }),
+              { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
           return new Response(
             JSON.stringify({ error: issueInfoResp.status === 401 || issueInfoResp.status === 403
               ? "星亿娱乐登录已过期，请重新登录"
-              : "未能读取星亿娱乐当前期号" }),
-            { status: issueInfoResp.status === 401 || issueInfoResp.status === 403 ? 401 : 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+              : isRateLimited(issueInfoResp.status)
+                ? xyPublicError(issueInfoResp.status)
+                : "未能读取星亿娱乐当前期号" }),
+            { status: issueInfoResp.status === 401 || issueInfoResp.status === 403
+              ? 401
+              : isRateLimited(issueInfoResp.status) ? 429 : 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
           );
         }
+        const issue = hyphenIssue(current.serial);
+        xyIssueCache.set(issueCacheKey, { issue, closeAt: current.closeAt, at: Date.now() });
         return new Response(
           JSON.stringify({
-            issue: hyphenIssue(current.serial),
+            issue,
             closeAt: current.closeAt,
           }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       } catch (err) {
+        if (cachedIssue) {
+          return new Response(
+            JSON.stringify({ issue: cachedIssue.issue, closeAt: cachedIssue.closeAt, cached: true }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
         return new Response(
           JSON.stringify({ error: err instanceof Error ? err.message : "读取星亿当前期号失败" }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }

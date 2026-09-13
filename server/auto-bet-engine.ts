@@ -35,6 +35,7 @@ type Job = AutoBetConfig & {
   scheduledAt: number | null;
   liveIssue: string | null;
   closeAt: number | null;
+  lastXyIssueAt?: number | null;
   lastError: string;
   lastPicks: number[];
   placing: boolean;
@@ -308,6 +309,7 @@ function startJob(config: AutoBetConfig) {
     scheduledAt: prev && !lotteryChanged ? prev.scheduledAt : null,
     liveIssue: lotteryChanged ? null : prev?.liveIssue ?? null,
     closeAt: lotteryChanged ? null : prev?.closeAt ?? null,
+    lastXyIssueAt: lotteryChanged ? null : prev?.lastXyIssueAt ?? null,
     lastError: "",
     lastPicks: prev?.lastPicks ?? [],
     placing: prev?.placing ?? false,
@@ -380,13 +382,34 @@ async function tickJob(job: Job) {
     let liveIssue: string | null = null;
     let closeAt: number | null = null;
     if (job.platform === "xingyi") {
-      const issueResp = await call("xyissue", { sessionId: betSession, lotteryId: job.lotteryId });
-      liveIssue = typeof issueResp.data.issue === "string" ? issueResp.data.issue : null;
-      closeAt = typeof issueResp.data.closeAt === "number" ? issueResp.data.closeAt : null;
-      if (!liveIssue) {
-        const err = String(issueResp.data.error ?? "未能读取当前期号");
-        await handleJobAuthFailure(job, issueResp.status, err, { countFail: true });
-        return;
+      const remain = job.closeAt != null ? job.closeAt - Date.now() : 0;
+      const skipIssue = Boolean(job.liveIssue)
+        && remain > 10_000
+        && job.lastXyIssueAt != null
+        && Date.now() - job.lastXyIssueAt < 8_000;
+      if (skipIssue) {
+        liveIssue = job.liveIssue;
+        closeAt = job.closeAt;
+      } else {
+        const issueResp = await call("xyissue", { sessionId: betSession, lotteryId: job.lotteryId });
+        liveIssue = typeof issueResp.data.issue === "string" ? issueResp.data.issue : null;
+        closeAt = typeof issueResp.data.closeAt === "number" ? issueResp.data.closeAt : null;
+        if (!liveIssue) {
+          const err = String(issueResp.data.error ?? "未能读取当前期号");
+          const rateLimited = issueResp.status === 429 || /过于频繁/.test(err);
+          if (rateLimited && job.liveIssue) {
+            liveIssue = job.liveIssue;
+            closeAt = job.closeAt;
+          } else if (rateLimited) {
+            job.lastError = err;
+            return;
+          } else {
+            await handleJobAuthFailure(job, issueResp.status, err, { countFail: true });
+            return;
+          }
+        } else {
+          job.lastXyIssueAt = Date.now();
+        }
       }
     }
 

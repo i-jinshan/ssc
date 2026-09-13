@@ -186,7 +186,9 @@ export async function sendTelegram(chatId: string, text: string): Promise<string
 }
 
 export function isLoginExpiredError(status: number, error: string): boolean {
+  if (status === 429) return false;
   if (status === 401 || status === 403) return true;
+  if (/过于频繁|Too Many Requests/i.test(error)) return false;
   return /登录已过期|会话已过期|请重新登录|请刷新验证码|缺少登录令牌|帐号已停用|Token错误|Unauthorized/i.test(error);
 }
 

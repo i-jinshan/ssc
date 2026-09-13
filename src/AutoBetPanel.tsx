@@ -260,7 +260,7 @@ export function AutoBetPanel({
     if (!placingBet) fetchBets();
   }, [placingBet, fetchBets]);
 
-  const fetchXyBalance = useCallback(async () => {
+  const fetchXyBalance = useCallback(async (force = false) => {
     if (platform !== 'xingyi' || !xySessionId) {
       setXyBalance(null);
       setXyBalanceError('');
@@ -271,7 +271,7 @@ export function AutoBetPanel({
       const resp = await fetch(`${API_URL}?action=xybalance`, {
         method: 'POST',
         headers: API_HEADERS,
-        body: JSON.stringify({ sessionId: xySessionId }),
+        body: JSON.stringify({ sessionId: xySessionId, force: force === true }),
       });
       const data = await resp.json() as { balance?: number; error?: string };
       if (isXySessionExpiredError(resp.status, data.error || '')) {
@@ -284,11 +284,9 @@ export function AutoBetPanel({
         setXyBalance(data.balance);
         setXyBalanceError('');
       } else {
-        setXyBalance(null);
         setXyBalanceError(data.error || '未能读取余额');
       }
     } catch {
-      setXyBalance(null);
       setXyBalanceError('读取余额失败');
     } finally {
       setLoadingBalance(false);
@@ -296,9 +294,9 @@ export function AutoBetPanel({
   }, [platform, xySessionId, onXySessionExpired]);
 
   useEffect(() => {
-    fetchXyBalance();
+    void fetchXyBalance();
     if (platform !== 'xingyi' || !xySessionId) return;
-    const interval = setInterval(fetchXyBalance, 30000);
+    const interval = setInterval(() => { void fetchXyBalance(); }, 60000);
     return () => clearInterval(interval);
   }, [fetchXyBalance, platform, xySessionId]);
 
@@ -710,7 +708,7 @@ export function AutoBetPanel({
             </div>
           </div>
           <button
-            onClick={fetchXyBalance}
+            onClick={() => { void fetchXyBalance(true); }}
             disabled={loadingBalance}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-50"
           >
