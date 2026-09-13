@@ -40,9 +40,27 @@ function issueKeys(issue: string): string[] {
   return [...new Set([raw, compact, hyphen].filter(Boolean))];
 }
 
+function issueParts(issue: string): { day: string; seq: number } | null {
+  const compact = String(issue ?? "").replace(/-/g, "");
+  if (!/^\d{9,}$/.test(compact)) return null;
+  const seq = Number.parseInt(compact.slice(8), 10);
+  if (!Number.isFinite(seq)) return null;
+  return { day: compact.slice(0, 8), seq };
+}
+
 function issuesMatch(a: string, b: string): boolean {
-  const left = new Set(issueKeys(a));
-  return issueKeys(b).some((key) => left.has(key));
+  const left = issueParts(a);
+  const right = issueParts(b);
+  if (left && right) return left.day === right.day && left.seq === right.seq;
+  const keys = new Set(issueKeys(a));
+  return issueKeys(b).some((key) => keys.has(key));
+}
+
+function drawDigits(numbers: unknown): number[] | null {
+  if (!Array.isArray(numbers) || numbers.length < 5) return null;
+  const digits = numbers.slice(0, 5).map((n) => Number(n));
+  if (digits.some((n) => !Number.isInteger(n) || n < 0 || n > 9)) return null;
+  return digits;
 }
 
 function betDedupeKey(sessionId: string, lotteryId: number, issue: string): string {
@@ -393,8 +411,10 @@ function parseRawData(html: string): unknown[] {
     if (parts.length < 6) continue;
     const issue = parts[0];
     if (!ISSUE_COMPACT.test(issue) && !ISSUE_HYPHEN_START.test(issue)) continue;
-    const numbers = parts.slice(1, 6).map((n) => parseInt(n, 10));
-    if (numbers.some((n) => isNaN(n) || n < 0 || n > 9)) continue;
+    let offset = 1;
+    if (/^\d{1,2}:\d{2}/.test(String(parts[1] ?? ""))) offset = 2;
+    const numbers = parts.slice(offset, offset + 5).map((n) => parseInt(n, 10));
+    if (numbers.length < 5 || numbers.some((n) => isNaN(n) || n < 0 || n > 9)) continue;
     const timeMatch = issueStr.match(/\d{2}:\d{2}/);
     results.push({ issue, time: timeMatch ? timeMatch[0] : "", numbers });
   }
@@ -1376,8 +1396,9 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     if (action === "betsettle") {
       const body = await req.json();
-      const { sessionId, draws } = body as {
+      const { sessionId, draws, lotteryId: lotteryIdRaw } = body as {
         sessionId: string;
+        lotteryId?: number;
         draws: { issue: string; numbers: number[] }[];
       };
 
@@ -1388,29 +1409,70 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
 
+      const lotteryId = Number(lotteryIdRaw);
+      const filterLottery = ALLOWED_LOTTERY_IDS.has(lotteryId);
       const ODDS = 9.49;
       let settledCount = 0;
-      const sessionBets = [...bets.values()].flat();
+      const member = memberForSessionId(sessionId);
+      const pool: BetRow[] = [];
+      const seen = new Set<string>();
+      const addBet = (bet: BetRow) => {
+        if (!bet?.id || seen.has(bet.id)) return;
+        if (filterLottery && bet.lottery_id !== lotteryId) return;
+        seen.add(bet.id);
+        pool.push(bet);
+      };
+      if (member) {
+        for (const bet of loadLedger(member.id)) addBet(bet as BetRow);
+      }
+      for (const list of bets.values()) {
+        for (const bet of list) {
+          if (member && bet.member_id && bet.member_id !== member.id) continue;
+          if (!member && bet.session_id !== sessionId) continue;
+          addBet(bet);
+        }
+      }
 
+      const drawMap = new Map<string, number[]>();
       for (const draw of draws) {
-        if (!Array.isArray(draw.numbers) || draw.numbers.length < 1) continue;
+        const digits = drawDigits(draw.numbers);
+        const parts = issueParts(draw.issue);
+        if (!digits || !parts) continue;
+        drawMap.set(`${parts.day}-${parts.seq}`, digits);
+      }
 
-        for (const bet of sessionBets) {
-          if (bet.status !== "pending") continue;
-          if (!issuesMatch(bet.issue, draw.issue)) continue;
-
-          const resultNumber = draw.numbers[(bet.position ?? 5) - 1];
-          if (typeof resultNumber !== "number" || !Number.isFinite(resultNumber)) continue;
-          const hit = bet.picks.includes(resultNumber);
-          const payout = hit ? bet.bet_amount * ODDS : 0;
-          const net = payout - bet.total_cost;
-          bet.status = hit ? "won" : "lost";
-          bet.result_number = resultNumber;
-          bet.payout = payout;
-          bet.net = net;
-          bet.settled_at = new Date().toISOString();
-          settledCount++;
-          upsertBet(bet);
+      for (const bet of pool) {
+        if (bet.status !== "pending" && bet.status !== "won" && bet.status !== "lost") continue;
+        const parts = issueParts(bet.issue);
+        if (!parts) continue;
+        const digits = drawMap.get(`${parts.day}-${parts.seq}`);
+        if (!digits) continue;
+        const pos = bet.position >= 1 && bet.position <= 5 ? bet.position : 5;
+        const resultNumber = digits[pos - 1];
+        if (typeof resultNumber !== "number") continue;
+        const hit = bet.picks.includes(resultNumber);
+        const nextStatus = hit ? "won" : "lost";
+        const payout = hit ? bet.bet_amount * ODDS : 0;
+        const net = payout - bet.total_cost;
+        if (
+          bet.status !== "pending" &&
+          bet.result_number === resultNumber &&
+          bet.status === nextStatus
+        ) {
+          continue;
+        }
+        bet.status = nextStatus;
+        bet.result_number = resultNumber;
+        bet.payout = payout;
+        bet.net = net;
+        bet.settled_at = new Date().toISOString();
+        settledCount++;
+        upsertBet(bet);
+        const memoryList = bets.get(bet.session_id);
+        if (memoryList) {
+          const index = memoryList.findIndex((item) => item.id === bet.id);
+          if (index >= 0) memoryList[index] = bet;
+          else memoryList.push(bet);
         }
       }
       if (settledCount > 0) persistLedgerNow();

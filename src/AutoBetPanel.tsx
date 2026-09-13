@@ -235,6 +235,7 @@ export function AutoBetPanel({
           headers: API_HEADERS,
           body: JSON.stringify({
             sessionId: bettingSessionId,
+            lotteryId: gameId,
             draws: draws.map((d) => ({ issue: d.issue, numbers: d.numbers })),
           }),
         });

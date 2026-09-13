@@ -1258,13 +1258,14 @@ function App() {
         headers: API_HEADERS,
         body: JSON.stringify({
           sessionId: sid,
+          lotteryId: gameId,
           draws: drawList.map((d) => ({ issue: d.issue, numbers: d.numbers })),
         }),
       });
     } catch {
       // ignore
     }
-  }, []);
+  }, [gameId]);
 
   const placeBet = useCallback(async (issue: string, picks: number[]) => {
     if (!sessionId || !issue || picks.length === 0) return;

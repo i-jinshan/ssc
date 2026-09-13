@@ -400,6 +400,7 @@ async function tickJob(job: Job) {
 
     await call("betsettle", {
       sessionId: betSession,
+      lotteryId: job.lotteryId,
       draws: draws.map((d) => ({ issue: d.issue, numbers: d.numbers })),
     });
 
