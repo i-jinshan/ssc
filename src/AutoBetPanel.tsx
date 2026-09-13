@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft, Wallet, CalendarDays, ChevronDown, ChevronUp, Bell } from 'lucide-react';
 import { API_URL, API_HEADERS } from '@/api';
-import { NumberBall, ballColor, compareBetHistory, nextMartingaleState, stakeWithMultiplier } from '@/App';
+import { NumberBall, ballColor, compareBetHistory, isXySessionExpiredError, nextMartingaleState, stakeWithMultiplier } from '@/App';
 
 export interface BetRow {
   id: string;
@@ -47,6 +47,7 @@ interface AutoBetPanelProps {
   boundXyLoginId?: string | null;
   onXyLoginSuccess: (sessionId: string) => void;
   onXyLogout: () => void;
+  onXySessionExpired: () => void;
 }
 
 export function AutoBetPanel({
@@ -73,6 +74,7 @@ export function AutoBetPanel({
   boundXyLoginId,
   onXyLoginSuccess,
   onXyLogout,
+  onXySessionExpired,
 }: AutoBetPanelProps) {
   const [bets, setBets] = useState<BetRow[]>([]);
   const [loadingBets, setLoadingBets] = useState(false);
@@ -271,7 +273,13 @@ export function AutoBetPanel({
         headers: API_HEADERS,
         body: JSON.stringify({ sessionId: xySessionId }),
       });
-      const data = await resp.json();
+      const data = await resp.json() as { balance?: number; error?: string };
+      if (isXySessionExpiredError(resp.status, data.error || '')) {
+        onXySessionExpired();
+        setXyBalance(null);
+        setXyBalanceError('');
+        return;
+      }
       if (typeof data.balance === 'number' && Number.isFinite(data.balance)) {
         setXyBalance(data.balance);
         setXyBalanceError('');
@@ -285,7 +293,7 @@ export function AutoBetPanel({
     } finally {
       setLoadingBalance(false);
     }
-  }, [platform, xySessionId]);
+  }, [platform, xySessionId, onXySessionExpired]);
 
   useEffect(() => {
     fetchXyBalance();
@@ -642,7 +650,7 @@ export function AutoBetPanel({
 
         {autoBetOn && (
           <p className="mt-3 text-xs leading-5 text-slate-500">
-            自动投注在本机服务里运行，关掉网页也会继续下。关机、休眠，或关掉跑项目的终端（npm run dev / npm start）后会停止。下次在本页关掉开关即可停止。
+            自动投注按彩种分别开关。切换到其他彩种时，这边显示关闭，原先彩种会在后台继续跑；只有在新彩种上再打开，才会停掉原来的任务并改投当前彩种。
           </p>
         )}
         {autoBetError && autoBetOn && (

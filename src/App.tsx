@@ -94,6 +94,20 @@ function persistGame(gameId: GameId) {
   }
 }
 
+function persistXySession(id: string | null) {
+  try {
+    if (id) localStorage.setItem(XY_SESSION_KEY, id);
+    else localStorage.removeItem(XY_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function isXySessionExpiredError(status: number, error: string): boolean {
+  if (status === 401 || status === 403) return true;
+  return /登录已过期|会话已过期|请重新登录|请刷新验证码|缺少登录令牌/.test(error);
+}
+
 function gameLabel(gameId: GameId): string {
   return GAMES.find((g) => g.id === gameId)?.label ?? '腾讯10分彩';
 }
@@ -1145,7 +1159,7 @@ function App() {
   const [martingaleResetDraft, setMartingaleResetDraft] = useState(() =>
     String(readStoredMartingaleReset())
   );
-  const [autoBetOn, setAutoBetOn] = useState(readStoredAutoBetOn);
+  const [autoBetOn, setAutoBetOn] = useState(false);
   const [betAmount, setBetAmount] = useState(readStoredBetAmount);
   const [placingBet, setPlacingBet] = useState(false);
   const [lastBetIssue, setLastBetIssue] = useState<string | null>(null);
@@ -1166,6 +1180,7 @@ function App() {
     issue?: string | null;
   } | null>(null);
   const autoBetPromptedRef = useRef(false);
+  const autoBetStartPendingRef = useRef(false);
   const [isMember, setIsMember] = useState(false);
   const [memberId, setMemberId] = useState<string | null>(null);
   const [boundXyLoginId, setBoundXyLoginId] = useState<string | null>(null);
@@ -1355,7 +1370,23 @@ function App() {
   placeBetRef.current = placeBet;
   drawsRef.current = draws;
 
+  const stopAutoBet = useCallback(() => {
+    persistAutoBetOn(false);
+    setAutoBetOn(false);
+    setScheduledBetAt(null);
+    setAutoBetServerError('');
+    void fetch(`${API_URL}?action=autobet-stop`, {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify({ memberId, sessionId }),
+    }).catch(() => {});
+  }, [memberId, sessionId]);
+
   const applyGame = useCallback((next: GameId) => {
+    if (next === gameIdRef.current) return;
+    persistAutoBetOn(false);
+    setAutoBetOn(false);
+    setScheduledBetAt(null);
     persistGame(next);
     setGameId(next);
     setDraws(readStoredDraws(next));
@@ -1400,8 +1431,22 @@ function App() {
           headers: API_HEADERS,
           body: JSON.stringify({ sessionId: xySessionId, lotteryId: gameId }),
         });
-        const data = await resp.json() as { issue?: string; closeAt?: number | null };
-        if (cancelled || typeof data.issue !== 'string' || !data.issue) return;
+        const data = await resp.json() as { issue?: string; closeAt?: number | null; error?: string };
+        if (cancelled) return;
+        if (isXySessionExpiredError(resp.status, data.error || '')) {
+          persistXySession(null);
+          setXySessionId(null);
+          persistAutoBetOn(false);
+          setAutoBetOn(false);
+          setScheduledBetAt(null);
+          void fetch(`${API_URL}?action=autobet-stop`, {
+            method: 'POST',
+            headers: API_HEADERS,
+            body: JSON.stringify({ memberId, sessionId }),
+          }).catch(() => {});
+          return;
+        }
+        if (typeof data.issue !== 'string' || !data.issue) return;
         const next = { issue: data.issue, closeAt: typeof data.closeAt === 'number' ? data.closeAt : null };
         xyLiveIssueRef.current = next;
         setXyLiveIssue(next);
@@ -1415,7 +1460,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [platform, xySessionId, gameId]);
+  }, [platform, xySessionId, gameId, memberId, sessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -1490,8 +1535,10 @@ function App() {
         };
         if (cancelled || !data.running) return;
         autoBetPromptedRef.current = true;
-        persistAutoBetOn(true);
-        setAutoBetOn(true);
+        if (data.lotteryId == null || data.lotteryId === gameId) {
+          persistAutoBetOn(true);
+          setAutoBetOn(true);
+        }
         setAutoBetPrompt({
           platform: data.platform,
           lotteryId: data.lotteryId,
@@ -1505,7 +1552,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [sessionId, isMember, memberId, canAutoBet]);
+  }, [sessionId, isMember, memberId, canAutoBet, gameId]);
 
   useEffect(() => {
     if (!autoBetOn || !sessionId || !isMember || !memberId || !canAutoBet) return;
@@ -1531,11 +1578,15 @@ function App() {
     })
       .then(async (resp) => {
         const data = await resp.json() as { error?: string; scheduledAt?: number | null };
+        autoBetStartPendingRef.current = false;
         if (data.error) setAutoBetServerError(data.error);
         else setAutoBetServerError('');
         if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
       })
-      .catch(() => setAutoBetServerError('无法启动后台自动投注，请确认本地服务在运行'));
+      .catch(() => {
+        autoBetStartPendingRef.current = false;
+        setAutoBetServerError('无法启动后台自动投注，请确认本地服务在运行');
+      });
   }, [
     autoBetOn,
     sessionId,
@@ -1556,7 +1607,7 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (!autoBetOn || !memberId) return;
+    if (!memberId) return;
     const pull = async () => {
       try {
         const resp = await fetch(`${API_URL}?action=autobet-status`, {
@@ -1573,22 +1624,30 @@ function App() {
           closeAt?: number | null;
           lotteryId?: number;
         };
-        if (typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
+        const sameGame = data.lotteryId == null || data.lotteryId === gameId;
+        if (sameGame && typeof data.scheduledAt === 'number') setScheduledBetAt(data.scheduledAt);
         else setScheduledBetAt(null);
-        setAutoBetServerError(data.lastError || '');
+        setAutoBetServerError(sameGame ? (data.lastError || '') : '');
         if (data.running === false && isAutoBetAuthStopError(data.lastError || '')) {
           persistAutoBetOn(false);
           setAutoBetOn(false);
+        } else if (!autoBetStartPendingRef.current) {
+          if (data.running && data.lotteryId === gameId) {
+            persistAutoBetOn(true);
+            setAutoBetOn(true);
+          } else if (data.running && data.lotteryId !== gameId) {
+            persistAutoBetOn(false);
+            setAutoBetOn(false);
+          } else if (!data.running) {
+            persistAutoBetOn(false);
+            setAutoBetOn(false);
+          }
         }
-        if (typeof data.lastBetIssue === 'string' && data.lastBetIssue) {
+        if (sameGame && typeof data.lastBetIssue === 'string' && data.lastBetIssue) {
           lastBetIssueRef.current = data.lastBetIssue;
           setLastBetIssue(data.lastBetIssue);
         }
-        if (
-          typeof data.issue === 'string' &&
-          data.issue &&
-          (data.lotteryId == null || data.lotteryId === gameId)
-        ) {
+        if (typeof data.issue === 'string' && data.issue && sameGame) {
           const next = { issue: data.issue, closeAt: typeof data.closeAt === 'number' ? data.closeAt : null };
           xyLiveIssueRef.current = next;
           setXyLiveIssue(next);
@@ -1600,7 +1659,7 @@ function App() {
     void pull();
     const timer = window.setInterval(pull, 2000);
     return () => window.clearInterval(timer);
-  }, [autoBetOn, memberId, sessionId, gameId]);
+  }, [memberId, sessionId, gameId]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
@@ -1733,7 +1792,15 @@ function App() {
               </button>
               <button
                 type="button"
-                onClick={() => setAutoBetPrompt(null)}
+                onClick={() => {
+                  const runningGame = autoBetPrompt.lotteryId;
+                  if (typeof runningGame === 'number' && isGameId(runningGame) && runningGame !== gameId) {
+                    applyGame(runningGame);
+                  }
+                  persistAutoBetOn(true);
+                  setAutoBetOn(true);
+                  setAutoBetPrompt(null);
+                }}
                 className="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-emerald-600"
               >
                 继续运行
@@ -2126,18 +2193,13 @@ function App() {
                   onToggleAutoBet={(on) => {
                     persistAutoBetOn(on);
                     if (on) {
+                      autoBetStartPendingRef.current = true;
                       lastBetIssueRef.current = null;
                       setLastBetIssue(null);
+                      setAutoBetOn(true);
                     } else {
-                      void fetch(`${API_URL}?action=autobet-stop`, {
-                        method: 'POST',
-                        headers: API_HEADERS,
-                        body: JSON.stringify({ memberId, sessionId }),
-                      }).catch(() => {});
-                      setScheduledBetAt(null);
-                      setAutoBetServerError('');
+                      stopAutoBet();
                     }
-                    setAutoBetOn(on);
                   }}
                   betAmount={betAmount}
                   onBetAmountChange={(amount) => {
@@ -2168,12 +2230,17 @@ function App() {
                   xySessionId={xySessionId}
                   boundXyLoginId={boundXyLoginId}
                   onXyLoginSuccess={(sid) => {
-                    try { localStorage.setItem(XY_SESSION_KEY, sid); } catch { /* ignore */ }
+                    persistXySession(sid);
                     setXySessionId(sid);
                   }}
                   onXyLogout={() => {
-                    try { localStorage.removeItem(XY_SESSION_KEY); } catch { /* ignore */ }
+                    persistXySession(null);
                     setXySessionId(null);
+                  }}
+                  onXySessionExpired={() => {
+                    persistXySession(null);
+                    setXySessionId(null);
+                    stopAutoBet();
                   }}
                 />
               )}
