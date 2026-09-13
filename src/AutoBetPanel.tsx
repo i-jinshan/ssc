@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
-import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft, Wallet, CalendarDays, ChevronDown, ChevronUp } from 'lucide-react';
+import { Zap, Loader2, Trash2, TrendingUp, TrendingDown, X, User, Lock, ShieldCheck, RefreshCw, AlertCircle, Eye, EyeOff, CheckCircle2, ArrowRight, ArrowLeft, Wallet, CalendarDays, ChevronDown, ChevronUp, Bell } from 'lucide-react';
 import { API_URL, API_HEADERS } from '@/api';
 import { NumberBall, ballColor, compareBetHistory, nextMartingaleState, stakeWithMultiplier } from '@/App';
 
@@ -44,6 +44,7 @@ interface AutoBetPanelProps {
   platform: BetPlatform;
   onPlatformChange: (platform: BetPlatform) => void;
   xySessionId: string | null;
+  boundXyLoginId?: string | null;
   onXyLoginSuccess: (sessionId: string) => void;
   onXyLogout: () => void;
 }
@@ -69,6 +70,7 @@ export function AutoBetPanel({
   platform,
   onPlatformChange,
   xySessionId,
+  boundXyLoginId,
   onXyLoginSuccess,
   onXyLogout,
 }: AutoBetPanelProps) {
@@ -95,15 +97,26 @@ export function AutoBetPanel({
     pending: number;
     winRate: number | null;
   }>>([]);
+  const [tgConfigured, setTgConfigured] = useState(false);
+  const [tgBound, setTgBound] = useState(false);
+  const [tgPending, setTgPending] = useState(false);
+  const [tgBot, setTgBot] = useState('');
+  const [tgUser, setTgUser] = useState('');
+  const [tgBoundUser, setTgBoundUser] = useState('');
+  const [tgLink, setTgLink] = useState('');
+  const [tgError, setTgError] = useState('');
+  const [tgBusy, setTgBusy] = useState(false);
+  const [tgTestOk, setTgTestOk] = useState('');
 
   const bettingSessionId = platform === 'xingyi' ? xySessionId : sessionId;
 
   const fetchDays = useCallback(async () => {
+    if (!sessionId) return;
     try {
       const resp = await fetch(`${API_URL}?action=betdays`, {
         method: 'POST',
         headers: API_HEADERS,
-        body: '{}',
+        body: JSON.stringify({ sessionId }),
       });
       if (!resp.ok) return;
       const data = await resp.json() as { days?: typeof days };
@@ -111,7 +124,53 @@ export function AutoBetPanel({
     } catch {
       // ignore
     }
-  }, []);
+  }, [sessionId]);
+
+  const loadTelegram = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const resp = await fetch(`${API_URL}?action=telegram-status`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = await resp.json() as {
+        configured?: boolean;
+        bound?: boolean;
+        pending?: boolean;
+        botUsername?: string;
+        username?: string | null;
+        error?: string;
+      };
+      if (!resp.ok) return;
+      setTgConfigured(Boolean(data.configured));
+      setTgBound(Boolean(data.bound));
+      setTgPending(Boolean(data.pending) && !data.bound);
+      setTgBot(data.botUsername || '');
+      if (data.username) {
+        setTgBoundUser(data.username);
+        setTgUser((prev) => prev || data.username || '');
+      }
+      if (data.bound) {
+        setTgPending(false);
+        setTgLink('');
+      }
+    } catch {
+      // ignore
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    void loadTelegram();
+  }, [loadTelegram]);
+
+  useEffect(() => {
+    if (!tgPending || tgBound) return;
+    const timer = window.setInterval(() => {
+      void loadTelegram();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [tgPending, tgBound, loadTelegram]);
 
   const clearHistory = useCallback(async () => {
     if (clearingDays) return;
@@ -121,7 +180,7 @@ export function AutoBetPanel({
       const resp = await fetch(`${API_URL}?action=betdays-clear`, {
         method: 'POST',
         headers: API_HEADERS,
-        body: JSON.stringify({ password: clearPassword }),
+        body: JSON.stringify({ password: clearPassword, sessionId }),
       });
       const data = await resp.json() as { success?: boolean; error?: string };
       if (!resp.ok || data.error) {
@@ -137,7 +196,7 @@ export function AutoBetPanel({
     } finally {
       setClearingDays(false);
     }
-  }, [clearPassword, clearingDays]);
+  }, [clearPassword, clearingDays, sessionId]);
 
   const fetchBets = useCallback(async () => {
     if (!sessionId && !bettingSessionId) return;
@@ -284,6 +343,94 @@ export function AutoBetPanel({
     }
   };
 
+  const startTelegramBind = async () => {
+    setTgBusy(true);
+    setTgError('');
+    setTgTestOk('');
+    try {
+      const resp = await fetch(`${API_URL}?action=telegram-bind-start`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId, username: tgUser }),
+      });
+      const data = await resp.json() as {
+        username?: string;
+        botUsername?: string;
+        botLink?: string;
+        error?: string;
+      };
+      if (!resp.ok || data.error) {
+        setTgError(data.error || '无法开始绑定');
+        return;
+      }
+      if (!data.botLink) {
+        setTgError('机器人用户名暂时拿不到，请稍后重试，或在 Telegram 搜索管理员配置的机器人并点 Start');
+      }
+      setTgUser(data.username || tgUser);
+      setTgBoundUser(data.username || tgUser);
+      setTgBot(data.botUsername || '');
+      setTgLink(data.botLink || '');
+      setTgPending(true);
+      setTgConfigured(true);
+      if (data.botLink) {
+        window.open(data.botLink, '_blank', 'noopener,noreferrer');
+      }
+    } catch {
+      setTgError('绑定请求失败');
+    } finally {
+      setTgBusy(false);
+    }
+  };
+
+  const unbindTelegram = async () => {
+    setTgBusy(true);
+    setTgError('');
+    setTgTestOk('');
+    try {
+      const resp = await fetch(`${API_URL}?action=telegram-unbind`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = await resp.json() as { error?: string };
+      if (!resp.ok || data.error) {
+        setTgError(data.error || '解绑失败');
+        return;
+      }
+      setTgBound(false);
+      setTgPending(false);
+      setTgBoundUser('');
+      setTgLink('');
+    } catch {
+      setTgError('解绑失败');
+    } finally {
+      setTgBusy(false);
+    }
+  };
+
+  const testTelegram = async () => {
+    setTgBusy(true);
+    setTgError('');
+    setTgTestOk('');
+    try {
+      const resp = await fetch(`${API_URL}?action=telegram-test`, {
+        method: 'POST',
+        headers: API_HEADERS,
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = await resp.json() as { error?: string };
+      if (!resp.ok || data.error) {
+        setTgError(data.error || '测试发送失败');
+        return;
+      }
+      setTgTestOk('已发送测试消息，请到 Telegram 查看');
+    } catch {
+      setTgError('测试发送失败');
+    } finally {
+      setTgBusy(false);
+    }
+  };
+
   const handlePlaceBet = () => {
     if (platform === 'xingyi' && !xySessionId) {
       setShowXyLogin(true);
@@ -359,6 +506,88 @@ export function AutoBetPanel({
               )}
             </div>
           )}
+        </div>
+
+        <div className="mb-5 rounded-xl border border-sky-100 bg-sky-50/70 px-4 py-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="inline-flex items-center gap-2 text-sm font-medium text-slate-800">
+                <Bell className="h-4 w-4 text-sky-600" />
+                Telegram 过期提醒
+              </p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">
+                在本页填写你的 Telegram 用户名并点绑定，页面会打开机器人。你点一次 Start 后即可收到登录过期提醒，不用再填绑定码。
+              </p>
+            </div>
+            {tgBound ? (
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void testTelegram()}
+                  disabled={tgBusy}
+                  className="rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-xs font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-50"
+                >
+                  {tgBusy ? '发送中…' : '发送测试'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void unbindTelegram()}
+                  disabled={tgBusy}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                >
+                  解除绑定
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {tgBound && (
+            <p className="mt-2 text-xs font-medium text-emerald-700">
+              已绑定{tgBoundUser ? ` @${tgBoundUser}` : ''}，登录过期会推送到你的 Telegram。
+            </p>
+          )}
+          {!tgBound && (
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+              <input
+                value={tgUser}
+                onChange={(e) => setTgUser(e.target.value.replace(/^@/, ''))}
+                placeholder="Telegram 用户名，如 myname"
+                autoComplete="off"
+                className="w-full rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-sm text-slate-800 placeholder:text-slate-400 sm:max-w-xs"
+              />
+              <button
+                type="button"
+                onClick={() => void startTelegramBind()}
+                disabled={tgBusy || !tgUser.trim()}
+                className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+              >
+                {tgBusy ? '打开中…' : '绑定并打开 Telegram'}
+              </button>
+            </div>
+          )}
+          {tgPending && !tgBound && (
+            <div className="mt-3 rounded-lg border border-sky-200 bg-white px-3 py-2 text-sm text-slate-700">
+              <p>
+                已为 @{tgBoundUser || tgUser} 打开机器人
+                {tgLink ? (
+                  <>
+                    {' '}
+                    <a href={tgLink} target="_blank" rel="noreferrer" className="font-medium text-sky-700 underline">
+                      @{tgBot || '机器人'}
+                    </a>
+                  </>
+                ) : tgBot ? (
+                  <span className="font-medium"> @{tgBot}</span>
+                ) : null}
+                ，请点 Start。页面会自动确认绑定。
+              </p>
+              <p className="mt-1 text-xs text-slate-500">Telegram 必须点一次机器人才能收消息，没有绑定码这一步。</p>
+            </div>
+          )}
+          {!tgConfigured && !tgBound && (
+            <p className="mt-2 text-xs text-amber-700">管理员还没在后台配置 Telegram 机器人，绑定会失败。</p>
+          )}
+          {tgError && <p className="mt-2 text-xs text-rose-600">{tgError}</p>}
+          {tgTestOk && <p className="mt-2 text-xs text-emerald-700">{tgTestOk}</p>}
         </div>
 
         <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
@@ -749,6 +978,7 @@ export function AutoBetPanel({
       {/* 星亿娱乐 login modal */}
       {showXyLogin && (
         <XyLoginModal
+          boundXyLoginId={boundXyLoginId}
           onClose={() => setShowXyLogin(false)}
           onSuccess={(sid) => {
             onXyLoginSuccess(sid);
@@ -763,11 +993,12 @@ export function AutoBetPanel({
 // ── 星亿娱乐 login modal ──
 
 interface XyLoginModalProps {
+  boundXyLoginId?: string | null;
   onClose: () => void;
   onSuccess: (sessionId: string) => void;
 }
 
-function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
+function XyLoginModal({ boundXyLoginId, onClose, onSuccess }: XyLoginModalProps) {
   const [step, setStep] = useState<1 | 2>(1);
   const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
@@ -818,6 +1049,10 @@ function XyLoginModal({ onClose, onSuccess }: XyLoginModalProps) {
     e.preventDefault();
     if (!loginId.trim() || !captchaInput.trim()) {
       setError('请填写帐号和验证码');
+      return;
+    }
+    if (boundXyLoginId && loginId.trim().toLowerCase() !== boundXyLoginId.trim().toLowerCase()) {
+      setError(`请使用该会员绑定的星亿账号：${boundXyLoginId}`);
       return;
     }
     setLoading(true);

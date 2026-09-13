@@ -551,11 +551,13 @@ function DataTable({
   recs,
   pickCount,
   position,
+  showRecs,
 }: {
   data: DrawResult[];
   recs: Map<string, RecResult>;
   pickCount: number;
   position: Position;
+  showRecs: boolean;
 }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -567,8 +569,12 @@ function DataTable({
               <th className="px-4 py-3 font-semibold">期号</th>
               <th className="px-4 py-3 font-semibold">开奖时间</th>
               <th className="px-4 py-3 font-semibold">开奖号码</th>
-              <th className="px-4 py-3 font-semibold">{positionLabel(position)}推荐 ({pickCount}码)</th>
-              <th className="px-4 py-3 font-semibold">是否中奖</th>
+              {showRecs && (
+                <>
+                  <th className="px-4 py-3 font-semibold">{positionLabel(position)}推荐 ({pickCount}码)</th>
+                  <th className="px-4 py-3 font-semibold">是否中奖</th>
+                </>
+              )}
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -587,6 +593,8 @@ function DataTable({
                       ))}
                     </div>
                   </td>
+                  {showRecs && (
+                    <>
                   <td className="px-4 py-3">
                     {rec.eligible ? (
                       <div className="flex flex-wrap gap-1">
@@ -620,6 +628,8 @@ function DataTable({
                       </span>
                     )}
                   </td>
+                    </>
+                  )}
                 </tr>
               );
             })}
@@ -1152,6 +1162,9 @@ function App() {
     issue?: string | null;
   } | null>(null);
   const autoBetPromptedRef = useRef(false);
+  const [isMember, setIsMember] = useState(false);
+  const [memberId, setMemberId] = useState<string | null>(null);
+  const [boundXyLoginId, setBoundXyLoginId] = useState<string | null>(null);
   const [platform, setPlatform] = useState<BetPlatform>(() => {
     try { return (localStorage.getItem(BET_PLATFORM_KEY) as BetPlatform) || 'aoshi'; } catch { return 'aoshi'; }
   });
@@ -1226,6 +1239,11 @@ function App() {
     setDrawsError('');
     setLastBetIssue(null);
     lastBetIssueRef.current = null;
+    setIsMember(false);
+    setMemberId(null);
+    setBoundXyLoginId(null);
+    persistAutoBetOn(false);
+    setAutoBetOn(false);
   }, []);
 
   const settleBets = useCallback(async (sid: string | null, drawList: DrawResult[]) => {
@@ -1394,6 +1412,55 @@ function App() {
 
   useEffect(() => {
     if (!sessionId) {
+      setIsMember(false);
+      setMemberId(null);
+      setBoundXyLoginId(null);
+      return;
+    }
+    let cancelled = false;
+    void fetch(`${API_URL}?action=member-check`, {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify({ sessionId }),
+    })
+      .then(async (resp) => {
+        const data = await resp.json() as {
+          isMember?: boolean;
+          member?: { id: string; xyLoginId: string } | null;
+        };
+        if (cancelled) return;
+        const ok = Boolean(data.isMember && data.member?.id);
+        setIsMember(ok);
+        setMemberId(ok ? data.member!.id : null);
+        setBoundXyLoginId(ok && data.member!.xyLoginId ? data.member!.xyLoginId : null);
+        if (!ok || !data.member!.xyLoginId) {
+          persistAutoBetOn(false);
+          setAutoBetOn(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIsMember(false);
+          setMemberId(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  const canAutoBet = Boolean(boundXyLoginId);
+
+  useEffect(() => {
+    if (!isMember && (tab === 'frequency' || tab === 'profit' || tab === 'autobet')) {
+      setTab('table');
+    } else if (!canAutoBet && tab === 'autobet') {
+      setTab('table');
+    }
+  }, [isMember, canAutoBet, tab]);
+
+  useEffect(() => {
+    if (!sessionId || !isMember || !memberId || !canAutoBet) {
       autoBetPromptedRef.current = false;
       setAutoBetPrompt(null);
       return;
@@ -1405,7 +1472,7 @@ function App() {
         const resp = await fetch(`${API_URL}?action=autobet-status`, {
           method: 'POST',
           headers: API_HEADERS,
-          body: '{}',
+          body: JSON.stringify({ memberId, sessionId }),
         });
         const data = await resp.json() as {
           running?: boolean;
@@ -1431,15 +1498,16 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [sessionId]);
+  }, [sessionId, isMember, memberId, canAutoBet]);
 
   useEffect(() => {
-    if (!autoBetOn || !sessionId) return;
+    if (!autoBetOn || !sessionId || !isMember || !memberId || !canAutoBet) return;
     if (platform === 'xingyi' && !xySessionId) return;
     void fetch(`${API_URL}?action=autobet-start`, {
       method: 'POST',
       headers: API_HEADERS,
       body: JSON.stringify({
+        memberId,
         platform,
         sessionId,
         xySessionId,
@@ -1475,16 +1543,19 @@ function App() {
     martingaleOn,
     martingaleFactor,
     martingaleReset,
+    isMember,
+    memberId,
+    canAutoBet,
   ]);
 
   useEffect(() => {
-    if (!autoBetOn) return;
+    if (!autoBetOn || !memberId) return;
     const pull = async () => {
       try {
         const resp = await fetch(`${API_URL}?action=autobet-status`, {
           method: 'POST',
           headers: API_HEADERS,
-          body: '{}',
+          body: JSON.stringify({ memberId, sessionId }),
         });
         const data = await resp.json() as {
           running?: boolean;
@@ -1513,7 +1584,7 @@ function App() {
     void pull();
     const timer = window.setInterval(pull, 2000);
     return () => window.clearInterval(timer);
-  }, [autoBetOn]);
+  }, [autoBetOn, memberId, sessionId]);
 
   const applyWindowSize = useCallback((raw: string) => {
     const parsed = Number.parseInt(raw, 10);
@@ -1589,10 +1660,16 @@ function App() {
 
   const tabs: { key: TabKey; label: string; icon: typeof Hash }[] = [
     { key: 'table', label: '开奖记录', icon: Hash },
-    { key: 'frequency', label: '号码频率', icon: BarChart3 },
+    ...(isMember
+      ? [{ key: 'frequency' as const, label: '号码频率', icon: BarChart3 }]
+      : []),
     { key: 'trend', label: '走势分析', icon: TrendingUp },
-    { key: 'profit', label: '盈亏模拟', icon: Wallet },
-    { key: 'autobet', label: '自动投注', icon: Zap },
+    ...(isMember
+      ? [{ key: 'profit' as const, label: '盈亏模拟', icon: Wallet }]
+      : []),
+    ...(canAutoBet
+      ? [{ key: 'autobet' as const, label: '自动投注', icon: Zap }]
+      : []),
   ];
 
   // Show login screen if not logged in
@@ -1626,7 +1703,7 @@ function App() {
                   void fetch(`${API_URL}?action=autobet-stop`, {
                     method: 'POST',
                     headers: API_HEADERS,
-                    body: '{}',
+                    body: JSON.stringify({ memberId, sessionId }),
                   }).catch(() => {});
                   persistAutoBetOn(false);
                   setAutoBetOn(false);
@@ -1677,6 +1754,7 @@ function App() {
                 </div>
                 <p className="text-sm text-slate-500">
                   {draws.length > 0 ? `已加载 ${draws.length} 期开奖数据` : '正在加载…'}
+                  {isMember ? (canAutoBet ? ' · 会员' : ' · 会员（仅数据）') : ' · 非会员'}
                 </p>
               </div>
             </div>
@@ -1717,6 +1795,8 @@ function App() {
                 />
                 <span className="text-slate-400">期</span>
               </label>
+              {isMember && (
+                <>
               <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600 shadow-sm">
                 <span className="whitespace-nowrap">推荐个数</span>
                 <input
@@ -1765,7 +1845,9 @@ function App() {
                   <option value="on">开启</option>
                 </select>
               </label>
-              {martingaleOn && (
+                </>
+              )}
+              {isMember && martingaleOn && (
                 <>
                   <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600 shadow-sm">
                     <span className="whitespace-nowrap">倍数</span>
@@ -1826,6 +1908,16 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+        {!isMember && (
+          <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800">
+            当前登录账号不是会员，只能查看开奖记录和走势。号码频率、数据推荐和自动投注已关闭。
+          </div>
+        )}
+        {isMember && !canAutoBet && (
+          <div className="mb-6 rounded-xl border border-sky-200 bg-sky-50 px-5 py-4 text-sm text-sky-800">
+            当前会员未绑定星亿账号，可以使用数据推荐，但不能自动投注。请在后台补绑星亿账号后再使用自动投注。
+          </div>
+        )}
         {/* Bet error banner */}
         {betError && (
           <div className="mb-6 flex items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-600">
@@ -1879,13 +1971,15 @@ function App() {
         {/* Data display */}
         {draws.length > 0 && (
           <>
-            <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <div className={`grid gap-4 ${isMember ? 'grid-cols-2 lg:grid-cols-4' : 'grid-cols-1'}`}>
               <StatCard
                 label="总期数"
                 value={overview.total}
                 sub="本期加载"
                 accent="bg-gradient-to-r from-sky-500 to-sky-600"
               />
+              {isMember && (
+                <>
               <StatCard
                 label="最大连胜"
                 value={overview.maxWin}
@@ -1908,6 +2002,8 @@ function App() {
                 }
                 accent="bg-gradient-to-r from-violet-500 to-indigo-600"
               />
+                </>
+              )}
             </div>
 
             {/* Latest draw highlight */}
@@ -1929,7 +2025,8 @@ function App() {
             </div>
 
             {/* Next draw recommendation */}
-            {overview.nextPicks.length > 0 ? (
+            {isMember && (
+              overview.nextPicks.length > 0 ? (
               <div className="mt-4 overflow-hidden rounded-2xl border border-sky-200 bg-gradient-to-br from-sky-50 to-emerald-50 p-6 shadow-sm">
                 <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                   <div>
@@ -1946,10 +2043,11 @@ function App() {
                   </div>
                 </div>
               </div>
-            ) : (
+              ) : (
               <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800">
                 已加载 {overview.total} 期，统计窗口为 {windowSize} 期。记录不足，暂不推荐 {pickCount} 码、不计算盈亏。
               </div>
+              )
             )}
 
             {/* Tabs */}
@@ -1987,9 +2085,9 @@ function App() {
             {/* Content */}
             <div className="mt-6">
               {tab === 'table' && (
-                <DataTable data={filtered} recs={recommendation.recs} pickCount={pickCount} position={position} />
+                <DataTable data={filtered} recs={recommendation.recs} pickCount={pickCount} position={position} showRecs={isMember} />
               )}
-              {tab === 'frequency' && <FrequencyChart data={draws} windowSize={windowSize} position={position} />}
+              {tab === 'frequency' && isMember && <FrequencyChart data={draws} windowSize={windowSize} position={position} />}
               {tab === 'trend' && <TrendChart data={draws} position={position} />}
               {tab === 'profit' && (
                 <ProfitSim
@@ -2004,7 +2102,7 @@ function App() {
                   position={position}
                 />
               )}
-              {tab === 'autobet' && (
+              {tab === 'autobet' && canAutoBet && (
                 <AutoBetPanel
                   sessionId={sessionId ?? ''}
                   gameId={gameId}
@@ -2018,7 +2116,7 @@ function App() {
                       void fetch(`${API_URL}?action=autobet-stop`, {
                         method: 'POST',
                         headers: API_HEADERS,
-                        body: '{}',
+                        body: JSON.stringify({ memberId, sessionId }),
                       }).catch(() => {});
                       setScheduledBetAt(null);
                       setAutoBetServerError('');
@@ -2052,6 +2150,7 @@ function App() {
                     setPlatform(next);
                   }}
                   xySessionId={xySessionId}
+                  boundXyLoginId={boundXyLoginId}
                   onXyLoginSuccess={(sid) => {
                     try { localStorage.setItem(XY_SESSION_KEY, sid); } catch { /* ignore */ }
                     setXySessionId(sid);

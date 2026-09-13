@@ -14,7 +14,7 @@ function loadHandler() {
 }
 
 function shouldReloadProxy(file: string): boolean {
-  return /lottery-proxy|auto-bet-engine|bet-ledger|martingale/.test(file.replace(/\\/g, '/'));
+  return /lottery-proxy|auto-bet-engine|bet-ledger|martingale|members|runtime-store|admin-auth|telegram/.test(file.replace(/\\/g, '/'));
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {

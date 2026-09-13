@@ -8,6 +8,7 @@ export const REBATE_AMOUNT = 475;
 export type LedgerBet = {
   id: string;
   session_id: string;
+  member_id?: string;
   lottery_id: number;
   issue: string;
   picks: number[];
@@ -97,9 +98,10 @@ function scheduleSave() {
   }, 200);
 }
 
-export function loadLedger(): LedgerBet[] {
+export function loadLedger(memberId?: string): LedgerBet[] {
   ensureLoaded();
-  return records;
+  if (!memberId) return records;
+  return records.filter((item) => item.member_id === memberId);
 }
 
 export function upsertBet(bet: LedgerBet) {
@@ -119,9 +121,10 @@ export function removeBet(betId: string) {
   scheduleSave();
 }
 
-export function clearLedger() {
+export function clearLedger(memberId?: string) {
   ensureLoaded();
-  records = [];
+  if (!memberId) records = [];
+  else records = records.filter((item) => item.member_id !== memberId);
   persistLedgerNow();
 }
 
@@ -137,10 +140,11 @@ export function persistLedgerNow() {
   }
 }
 
-export function dailySummary(): DailySummaryRow[] {
+export function dailySummary(memberId?: string): DailySummaryRow[] {
   ensureLoaded();
+  const source = memberId ? records.filter((item) => item.member_id === memberId) : records;
   const groups = new Map<string, DailySummaryRow>();
-  for (const bet of records) {
+  for (const bet of source) {
     const date = beijingDate(bet.created_at);
     let row = groups.get(date);
     if (!row) {
@@ -179,4 +183,42 @@ export function dailySummary(): DailySummaryRow[] {
     row.winRate = row.settled > 0 ? row.wins / row.settled : null;
   }
   return rows;
+}
+
+export type LedgerTotals = {
+  turnover: number;
+  net: number;
+  rebate: number;
+  wins: number;
+  losses: number;
+  pending: number;
+  settled: number;
+  winRate: number | null;
+};
+
+export function summarizeDays(days: DailySummaryRow[]): LedgerTotals {
+  const totals: LedgerTotals = {
+    turnover: 0,
+    net: 0,
+    rebate: 0,
+    wins: 0,
+    losses: 0,
+    pending: 0,
+    settled: 0,
+    winRate: null,
+  };
+  for (const row of days) {
+    totals.turnover += row.turnover;
+    totals.net += row.net;
+    totals.rebate += row.rebate;
+    totals.wins += row.wins;
+    totals.losses += row.losses;
+    totals.pending += row.pending;
+    totals.settled += row.settled;
+  }
+  totals.turnover = roundMoney(totals.turnover);
+  totals.net = roundMoney(totals.net);
+  totals.rebate = roundMoney(totals.rebate);
+  totals.winRate = totals.settled > 0 ? totals.wins / totals.settled : null;
+  return totals;
 }

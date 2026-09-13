@@ -1,4 +1,7 @@
 import { nextMartingaleState, stakeWithMultiplier } from "../src/martingale.ts";
+import { findMemberByAoshi, findMemberById } from "./members";
+import { loadPersistedJobs, savePersistedJobs } from "./runtime-store";
+import { alertMemberLoginExpired, isLoginExpiredError } from "./telegram";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,8 +10,10 @@ const corsHeaders = {
 };
 
 type Bet = { issue: string; status: string; created_at?: string };
+type Draw = { issue: string; numbers: number[]; time?: string };
 
 export type AutoBetConfig = {
+  memberId: string;
   platform: "aoshi" | "xingyi";
   sessionId: string;
   xySessionId?: string | null;
@@ -36,21 +41,32 @@ type Job = AutoBetConfig & {
 };
 
 type ProxyCall = (action: string, body: unknown) => Promise<{ status: number; data: Record<string, unknown> }>;
+type SessionLookup = (sessionId: string) => { login_id?: string } | undefined;
 
 const g = globalThis as typeof globalThis & {
   __sscAutoBet?: {
-    job: Job | null;
+    jobs: Map<string, Job>;
     timer: ReturnType<typeof setInterval> | null;
     call: ProxyCall | null;
+    getSession: SessionLookup | null;
     tick: (() => Promise<void>) | null;
   };
 };
 
 function store() {
-  if (!g.__sscAutoBet) {
-    g.__sscAutoBet = { job: null, timer: null, call: null, tick: null };
+  const existing = g.__sscAutoBet as (typeof g.__sscAutoBet) & { job?: Job | null };
+  if (!existing || !existing.jobs) {
+    const jobs = new Map<string, Job>();
+    if (existing?.job?.memberId) jobs.set(existing.job.memberId, existing.job);
+    g.__sscAutoBet = {
+      jobs,
+      timer: existing?.timer ?? null,
+      call: existing?.call ?? null,
+      getSession: existing?.getSession ?? null,
+      tick: existing?.tick ?? null,
+    };
   }
-  return g.__sscAutoBet;
+  return g.__sscAutoBet!;
 }
 
 function json(data: unknown, status = 200) {
@@ -171,6 +187,7 @@ function jobSnapshot(job: Job | null) {
   return {
     running: job.enabled,
     enabled: job.enabled,
+    memberId: job.memberId,
     platform: job.platform,
     lotteryId: job.lotteryId,
     lastBetIssue: job.lastBetIssue,
@@ -194,9 +211,20 @@ function ensureTimer() {
   }, 1000);
 }
 
-export function setProxyCall(call: ProxyCall) {
-  store().call = call;
+export function setProxyCall(call: ProxyCall, getSession?: SessionLookup) {
+  const s = store();
+  s.call = call;
+  if (getSession) s.getSession = getSession;
   ensureTimer();
+  const saved = loadPersistedJobs();
+  for (const item of saved) {
+    if (!item.memberId || !findMemberById(item.memberId)) continue;
+    if (item.enabled && !s.jobs.get(item.memberId)?.enabled) {
+      startJob(item);
+      const current = s.jobs.get(item.memberId);
+      if (current) current.lastBetIssue = item.lastBetIssue;
+    }
+  }
 }
 
 function parseConfig(body: Record<string, unknown>): AutoBetConfig | string {
@@ -215,7 +243,22 @@ function parseConfig(body: Record<string, unknown>): AutoBetConfig | string {
   if (!(windowSize >= 1 && windowSize <= 100)) return "窗口无效";
   if (!(pickCount >= 1 && pickCount <= 10)) return "选号个数无效";
   if (!(betAmount > 0)) return "金额无效";
+
+  const getSession = store().getSession;
+  const aoshiSession = getSession?.(sessionId);
+  const member = findMemberByAoshi(aoshiSession?.login_id ?? "") ?? findMemberById(String(body.memberId ?? ""));
+  if (!member) return "当前账号不是会员，无法自动投注";
+  if (!member.xyLoginId.trim()) return "未绑定星亿账号，无法自动投注";
+  if (platform === "xingyi") {
+    const xySession = getSession?.(xySessionId ?? "");
+    const xyLogin = (xySession?.login_id ?? "").trim().toLowerCase();
+    if (!xyLogin || xyLogin !== member.xyLoginId.trim().toLowerCase()) {
+      return "星亿账号必须与该会员绑定的账号一致";
+    }
+  }
+
   return {
+    memberId: member.id,
     platform,
     sessionId,
     xySessionId,
@@ -231,11 +274,32 @@ function parseConfig(body: Record<string, unknown>): AutoBetConfig | string {
   };
 }
 
+function persistJobs() {
+  const jobs = [...store().jobs.values()].map((job) => ({
+    enabled: job.enabled,
+    memberId: job.memberId,
+    platform: job.platform,
+    sessionId: job.sessionId,
+    xySessionId: job.xySessionId,
+    lotteryId: job.lotteryId,
+    position: job.position,
+    windowSize: job.windowSize,
+    pickCount: job.pickCount,
+    excludeLast: job.excludeLast,
+    betAmount: job.betAmount,
+    martingaleOn: job.martingaleOn,
+    martingaleFactor: job.martingaleFactor,
+    martingaleReset: job.martingaleReset,
+    lastBetIssue: job.lastBetIssue,
+  }));
+  savePersistedJobs(jobs);
+}
+
 function startJob(config: AutoBetConfig) {
   const s = store();
-  const prev = s.job;
+  const prev = s.jobs.get(config.memberId);
   const lotteryChanged = prev && prev.lotteryId !== config.lotteryId;
-  s.job = {
+  s.jobs.set(config.memberId, {
     ...config,
     enabled: true,
     lastBetIssue: lotteryChanged || !prev?.enabled ? null : prev.lastBetIssue,
@@ -246,25 +310,56 @@ function startJob(config: AutoBetConfig) {
     lastError: "",
     lastPicks: prev?.lastPicks ?? [],
     placing: prev?.placing ?? false,
-  };
+  });
+  persistJobs();
   ensureTimer();
 }
 
-function stopJob() {
+function stopJob(memberId?: string) {
   const s = store();
-  if (s.job) {
-    s.job.enabled = false;
-    s.job.scheduledAt = null;
-    s.job.scheduledIssue = null;
-    s.job.placing = false;
+  if (memberId) {
+    const job = s.jobs.get(memberId);
+    if (job) {
+      job.enabled = false;
+      job.scheduledAt = null;
+      job.scheduledIssue = null;
+      job.placing = false;
+    }
+  } else {
+    for (const job of s.jobs.values()) {
+      job.enabled = false;
+      job.scheduledAt = null;
+      job.scheduledIssue = null;
+      job.placing = false;
+    }
   }
+  persistJobs();
+}
+
+export function stopJobForMember(memberId: string) {
+  const s = store();
+  s.jobs.delete(memberId);
+  persistJobs();
+}
+
+async function handleJobAuthFailure(job: Job, status: number, error: string) {
+  job.lastError = error;
+  if (!isLoginExpiredError(status, error)) return;
+  await alertMemberLoginExpired(job.memberId, job.platform, error);
+  stopJob(job.memberId);
 }
 
 async function tick() {
   const s = store();
-  const job = s.job;
+  for (const job of [...s.jobs.values()]) {
+    if (job.enabled) await tickJob(job);
+  }
+}
+
+async function tickJob(job: Job) {
+  const s = store();
   const call = s.call;
-  if (!job?.enabled || !call || job.placing) return;
+  if (!job.enabled || !call || job.placing) return;
 
   try {
     const betSession = job.platform === "xingyi" ? job.xySessionId : job.sessionId;
@@ -280,7 +375,8 @@ async function tick() {
       liveIssue = typeof issueResp.data.issue === "string" ? issueResp.data.issue : null;
       closeAt = typeof issueResp.data.closeAt === "number" ? issueResp.data.closeAt : null;
       if (!liveIssue) {
-        job.lastError = String(issueResp.data.error ?? "未能读取当前期号");
+        const err = String(issueResp.data.error ?? "未能读取当前期号");
+        await handleJobAuthFailure(job, issueResp.status, err);
         return;
       }
     }
@@ -288,7 +384,8 @@ async function tick() {
     const drawsResp = await call("draws", { sessionId: job.sessionId, issueCount: 100, lotteryId: job.lotteryId });
     const draws = Array.isArray(drawsResp.data.draws) ? (drawsResp.data.draws as Draw[]) : [];
     if (draws.length === 0) {
-      job.lastError = String(drawsResp.data.error ?? "未获取到开奖数据");
+      const err = String(drawsResp.data.error ?? "未获取到开奖数据");
+      await handleJobAuthFailure(job, drawsResp.status, err);
       return;
     }
 
@@ -366,40 +463,54 @@ async function tick() {
         job.scheduledAt = null;
         job.scheduledIssue = null;
         job.lastError = "";
+        persistJobs();
       } else {
         job.lastError = String(betResp.data.error ?? `投注失败（HTTP ${betResp.status}）`);
+        await handleJobAuthFailure(job, betResp.status, job.lastError);
       }
     } finally {
       job.placing = false;
     }
   } catch (err) {
-    if (s.job) {
-      s.job.placing = false;
-      s.job.lastError = err instanceof Error ? err.message : "自动投注异常";
-    }
+    job.placing = false;
+    job.lastError = err instanceof Error ? err.message : "自动投注异常";
+    await handleJobAuthFailure(job, 0, job.lastError);
   }
+}
+
+function readMemberId(body: Record<string, unknown>): string {
+  return typeof body.memberId === "string" ? body.memberId : "";
+}
+
+function jobForRequest(body: Record<string, unknown>): Job | null {
+  const memberId = readMemberId(body);
+  if (memberId) return store().jobs.get(memberId) ?? null;
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+  if (!sessionId) return null;
+  return [...store().jobs.values()].find((job) => job.sessionId === sessionId || job.xySessionId === sessionId) ?? null;
 }
 
 export async function handleAutoBetHttp(action: string, req: Request): Promise<Response | null> {
   if (!action.startsWith("autobet-")) return null;
-  if (action === "autobet-status") {
-    return json(jobSnapshot(store().job));
-  }
   let body: Record<string, unknown> = {};
   try {
     body = (await req.json()) as Record<string, unknown>;
   } catch {
     body = {};
   }
+  if (action === "autobet-status") {
+    return json(jobSnapshot(jobForRequest(body)));
+  }
   if (action === "autobet-stop") {
-    stopJob();
-    return json({ success: true, ...jobSnapshot(store().job) });
+    const memberId = readMemberId(body) || jobForRequest(body)?.memberId;
+    stopJob(memberId);
+    return json({ success: true, ...jobSnapshot(memberId ? store().jobs.get(memberId) ?? null : null) });
   }
   if (action === "autobet-start") {
     const parsed = parseConfig(body);
     if (typeof parsed === "string") return json({ error: parsed }, 400);
     startJob(parsed);
-    return json({ success: true, ...jobSnapshot(store().job) });
+    return json({ success: true, ...jobSnapshot(store().jobs.get(parsed.memberId) ?? null) });
   }
   return json({ error: "Unknown autobet action" }, 400);
 }

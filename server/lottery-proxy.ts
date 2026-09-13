@@ -4,8 +4,12 @@ import { Buffer } from "node:buffer";
 import { writeFileSync } from "node:fs";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import type { Dispatcher } from "undici";
-import { handleAutoBetHttp, setProxyCall } from "./auto-bet-engine";
-import { clearLedger, dailySummary, loadLedger, persistLedgerNow, removeBet, upsertBet } from "./bet-ledger";
+import { handleAutoBetHttp, setProxyCall, stopJobForMember } from "./auto-bet-engine";
+import { clearLedger, dailySummary, loadLedger, persistLedgerNow, removeBet, summarizeDays, upsertBet } from "./bet-ledger";
+import { getAdminUsername, updateAdminAccount, verifyAdminLogin } from "./admin-auth";
+import { addMember, findMemberByAoshi, findMemberByXy, listMembers, removeMember, startTelegramBind, telegramPublic, unbindTelegram, updateMember, type Member } from "./members";
+import { clearTelegramBotToken, ensureTelegramPoller, saveTelegramBotToken, sendTelegram, telegramApiBase, telegramBotToken, telegramBotUsername, telegramTokenMasked } from "./telegram";
+import { loadPersistedSessions, savePersistedSessions } from "./runtime-store";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -84,6 +88,7 @@ interface BetRow {
   settled_at: string | null;
   position: number;
   remote_ids?: string[];
+  member_id?: string;
 }
 
 const sessions = new Map<string, SessionRow>();
@@ -93,6 +98,43 @@ for (const bet of loadLedger()) {
   if (!bets.has(bet.session_id)) bets.set(bet.session_id, []);
   const list = bets.get(bet.session_id)!;
   if (!list.some((item) => item.id === bet.id)) list.push(bet);
+}
+
+for (const row of loadPersistedSessions()) {
+  if (row?.id) sessions.set(row.id, row);
+}
+
+function persistSessions() {
+  savePersistedSessions([...sessions.values()]);
+}
+
+const adminTokens = new Set<string>();
+
+function adminAuthorized(req: Request, body: Record<string, unknown>): boolean {
+  const header = req.headers.get("authorization") ?? "";
+  const bearer = header.replace(/^Bearer\s+/i, "").trim();
+  const token = bearer || String(body.adminToken ?? "").trim();
+  return Boolean(token) && adminTokens.has(token);
+}
+
+function memberForLogin(loginId?: string | null): Member | null {
+  if (!loginId) return null;
+  return findMemberByAoshi(loginId) ?? findMemberByXy(loginId);
+}
+
+function memberForSession(session?: SessionRow): Member | null {
+  return memberForLogin(session?.login_id);
+}
+
+function memberForSessionId(sessionId?: string): Member | null {
+  if (!sessionId) return null;
+  return memberForSession(sessions.get(sessionId));
+}
+
+function withMemberId<T extends { member_id?: string }>(bet: T, session?: SessionRow): T {
+  const member = memberForSession(session);
+  if (member) bet.member_id = member.id;
+  return bet;
 }
 
 let cachedProxyUrl: string | undefined;
@@ -372,6 +414,326 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     const autoBetResp = await handleAutoBetHttp(action, req);
     if (autoBetResp) return autoBetResp;
 
+    if (action === "admin-login") {
+      const body = (await req.json().catch(() => ({}))) as { username?: string; password?: string };
+      if (!verifyAdminLogin(String(body.username ?? ""), String(body.password ?? ""))) {
+        return new Response(JSON.stringify({ error: "账号或密码错误" }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const token = crypto.randomUUID();
+      adminTokens.add(token);
+      return new Response(JSON.stringify({
+        success: true,
+        adminToken: token,
+        username: getAdminUsername(),
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "admin-account") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ username: getAdminUsername() }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "admin-account-update") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const result = updateAdminAccount(
+        String(body.currentPassword ?? ""),
+        String(body.username ?? ""),
+        String(body.password ?? ""),
+      );
+      if (typeof result === "string") {
+        return new Response(JSON.stringify({ error: result }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true, username: result.username }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "telegram-admin-status") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const username = await telegramBotUsername();
+      return new Response(JSON.stringify({
+        configured: Boolean(telegramBotToken()),
+        tokenMasked: telegramTokenMasked(),
+        botUsername: username,
+        apiBase: telegramApiBase() === "https://api.telegram.org" ? "" : telegramApiBase(),
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "telegram-admin-save") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const result = await saveTelegramBotToken(String(body.botToken ?? ""), String(body.apiBase ?? ""));
+      if (typeof result === "string") {
+        return new Response(JSON.stringify({ error: result }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        success: true,
+        configured: true,
+        botUsername: result.username,
+        tokenMasked: telegramTokenMasked(),
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "telegram-admin-clear") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      clearTelegramBotToken();
+      return new Response(JSON.stringify({ success: true, configured: false }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "members-list") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const members = listMembers().map((member) => {
+        const days = dailySummary(member.id);
+        return {
+          ...member,
+          days,
+          totals: summarizeDays(days),
+        };
+      });
+      return new Response(JSON.stringify({
+        members,
+        username: getAdminUsername(),
+        rebatePerTurnover: 10000,
+        rebateAmount: 475,
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "members-add") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const result = addMember(String(body.aoshiLoginId ?? ""), String(body.xyLoginId ?? ""));
+      if (typeof result === "string") {
+        return new Response(JSON.stringify({ error: result }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true, member: result, members: listMembers() }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "members-update") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const id = String(body.id ?? "");
+      const before = id ? listMembers().find((item) => item.id === id) : null;
+      const result = updateMember(id, String(body.aoshiLoginId ?? ""), String(body.xyLoginId ?? ""));
+      if (typeof result === "string") {
+        return new Response(JSON.stringify({ error: result }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (before?.xyLoginId && !result.xyLoginId) stopJobForMember(id);
+      return new Response(JSON.stringify({ success: true, member: result, members: listMembers() }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "members-delete") {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!adminAuthorized(req, body)) {
+        return new Response(JSON.stringify({ error: "请先登录后台" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const id = String(body.id ?? "");
+      if (!id || !removeMember(id)) {
+        return new Response(JSON.stringify({ error: "会员不存在" }), {
+          status: 404,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      stopJobForMember(id);
+      return new Response(JSON.stringify({ success: true, members: listMembers() }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "member-check") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string; loginId?: string };
+      const member = body.sessionId
+        ? memberForSessionId(body.sessionId)
+        : memberForLogin(body.loginId);
+      return new Response(
+        JSON.stringify({
+          isMember: Boolean(member),
+          canAutoBet: Boolean(member?.xyLoginId),
+          member: member
+            ? {
+                id: member.id,
+                aoshiLoginId: member.aoshiLoginId,
+                xyLoginId: member.xyLoginId,
+                createdAt: member.createdAt,
+              }
+            : null,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (action === "telegram-status") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string };
+      const member = memberForSessionId(body.sessionId);
+      if (!member) {
+        return new Response(JSON.stringify({ error: "不是会员" }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const username = await telegramBotUsername();
+      return new Response(
+        JSON.stringify({
+          configured: Boolean(telegramBotToken()),
+          botUsername: username,
+          ...telegramPublic(member),
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (action === "telegram-bind-start") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string; username?: string };
+      const member = memberForSessionId(body.sessionId);
+      if (!member) {
+        return new Response(JSON.stringify({ error: "不是会员" }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (!telegramBotToken()) {
+        return new Response(JSON.stringify({ error: "请先在会员后台配置 Telegram 机器人 Token" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const result = startTelegramBind(member.id, String(body.username ?? ""));
+      if (typeof result === "string") {
+        return new Response(JSON.stringify({ error: result }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const botName = await telegramBotUsername();
+      const botLink = botName ? `https://t.me/${botName}?start=${result.bindToken}` : "";
+      return new Response(
+        JSON.stringify({
+          success: true,
+          configured: true,
+          botUsername: botName,
+          username: result.username,
+          pending: true,
+          expiresAt: result.expiresAt,
+          botLink,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (action === "telegram-unbind") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string };
+      const member = memberForSessionId(body.sessionId);
+      if (!member) {
+        return new Response(JSON.stringify({ error: "不是会员" }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      unbindTelegram(member.id);
+      return new Response(JSON.stringify({ success: true, bound: false }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "telegram-test") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string };
+      const member = memberForSessionId(body.sessionId);
+      if (!member?.telegramChatId) {
+        return new Response(JSON.stringify({ error: "请先绑定 Telegram" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const err = await sendTelegram(member.telegramChatId, `【测试】自动投注提醒已接通。\n傲世账号：${member.aoshiLoginId}`);
+      if (err) {
+        return new Response(JSON.stringify({ error: err }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     if (action === "captcha") {
       // Step 1: Fetch homepage to get antiforgery cookie + token
       const home = await fetchWithCookies(LOTTERY_BASE + "/", "", {
@@ -562,10 +924,21 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           ...session,
           cookies: finalCookies,
           authenticated: true,
+          login_id: loginId,
         });
+        persistSessions();
+        const member = findMemberByAoshi(loginId);
 
         return new Response(
-          JSON.stringify({ success: true, sessionId }),
+          JSON.stringify({
+            success: true,
+            sessionId,
+            loginId,
+            isMember: Boolean(member),
+            member: member
+              ? { id: member.id, aoshiLoginId: member.aoshiLoginId, xyLoginId: member.xyLoginId }
+              : null,
+          }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       } else {
@@ -654,6 +1027,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       }
 
       sessions.set(sessionId, { ...session, cookies: currentCookies });
+      persistSessions();
 
       return new Response(
         JSON.stringify({
@@ -783,6 +1157,12 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         return new Response(
           JSON.stringify({ error: "会话已过期，请重新登录" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      if (!memberForSession(session)) {
+        return new Response(
+          JSON.stringify({ error: "当前账号不是会员，无法投注" }),
+          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
@@ -944,7 +1324,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         );
       }
       const totalCost = betAmount * picks.length;
-      const bet: BetRow = {
+      const bet: BetRow = withMemberId({
         id: betId,
         session_id: sessionId,
         lottery_id: lotteryId,
@@ -959,7 +1339,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         position: betPosition,
         created_at: new Date().toISOString(),
         settled_at: null,
-      };
+      }, session);
 
       if (!bets.has(sessionId)) bets.set(sessionId, []);
       bets.get(sessionId)!.push(bet);
@@ -976,13 +1356,14 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
     if (action === "betlist") {
       const body = await req.json();
-      const { lotteryId, status } = body as {
+      const { lotteryId, status, sessionId } = body as {
         sessionId?: string;
         lotteryId?: number;
         status?: string;
       };
 
-      let list = loadLedger();
+      const member = memberForSessionId(sessionId);
+      let list = member ? loadLedger(member.id) : [];
       if (lotteryId) list = list.filter((b) => b.lottery_id === lotteryId);
       if (status) list = list.filter((b) => b.status === status);
       list = [...list].sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? "")).slice(0, 2000);
@@ -1413,6 +1794,35 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       return xyAuthorizedFetch(path, cookieStr, token, { method: "POST", body, referer });
     }
 
+    async function xyRefreshAccessToken(cookieStr: string, token: string): Promise<{ token: string; cookies: string } | null> {
+      const paths = ["/api/Token/Refresh", "/api/Token/Renew", "/api/Token/GetToken"];
+      let cookies = cookieStr;
+      for (const path of paths) {
+        try {
+          const resp = await xyAuthorizedPost(path, {}, cookies, token, `${XY_BASE}/`);
+          cookies = resp.cookies;
+          const next = xyExtractAccessToken(resp.data);
+          if (next && resp.status < 400) return { token: next, cookies };
+        } catch {
+          // try next path
+        }
+      }
+      return null;
+    }
+
+    function xyMergeSessionToken(
+      sessionId: string,
+      session: SessionRow,
+      cookies: string,
+      data: Record<string, unknown>,
+      fallbackToken: string,
+    ) {
+      const next = xyExtractAccessToken(data) || fallbackToken;
+      sessions.set(sessionId, { ...session, cookies, login_token: next, authenticated: true });
+      persistSessions();
+      return next;
+    }
+
     function hyphenIssue(serial: string): string {
       const compact = String(serial).replace(/-/g, "");
       if (compact.length > 8) return `${compact.slice(0, 8)}-${compact.slice(8)}`;
@@ -1551,6 +1961,7 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
           // login succeeded even if wallet read fails
         }
         sessions.set(sessionId, { ...session, cookies, login_token: token, authenticated: true });
+        persistSessions();
         try {
           writeFileSync(
             "/Users/zj/Desktop/时时彩/.xy-wallet-last.json",
@@ -1669,19 +2080,37 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
       }
       const betReferer = `${XY_BASE}/Bet/${lotteryId}`;
       try {
-        const issueInfoResp = await xyAuthorizedPost(
+        let tokenNow = token;
+        let cookiesNow = session.cookies ?? "";
+        let issueInfoResp = await xyAuthorizedPost(
           `/api/Bet/IssueInfo/${lotteryId}`,
           {},
-          session.cookies ?? "",
-          token,
+          cookiesNow,
+          tokenNow,
           betReferer,
         );
-        sessions.set(sessionId, { ...session, cookies: issueInfoResp.cookies });
+        if (issueInfoResp.status === 401 || issueInfoResp.status === 403) {
+          const refreshed = await xyRefreshAccessToken(cookiesNow, tokenNow);
+          if (refreshed) {
+            tokenNow = refreshed.token;
+            cookiesNow = refreshed.cookies;
+            issueInfoResp = await xyAuthorizedPost(
+              `/api/Bet/IssueInfo/${lotteryId}`,
+              {},
+              cookiesNow,
+              tokenNow,
+              betReferer,
+            );
+          }
+        }
+        xyMergeSessionToken(sessionId, session, issueInfoResp.cookies, issueInfoResp.data, tokenNow);
         const current = xyCurrentIssueInfo(issueInfoResp.data);
         if (!current.serial) {
           return new Response(
-            JSON.stringify({ error: "未能读取星亿娱乐当前期号" }),
-            { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            JSON.stringify({ error: issueInfoResp.status === 401 || issueInfoResp.status === 403
+              ? "星亿娱乐登录已过期，请重新登录"
+              : "未能读取星亿娱乐当前期号" }),
+            { status: issueInfoResp.status === 401 || issueInfoResp.status === 403 ? 401 : 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
           );
         }
         return new Response(
@@ -1720,6 +2149,12 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
         return new Response(
           JSON.stringify({ error: "星亿娱乐会话已过期，请重新登录" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      if (!memberForSession(session)) {
+        return new Response(
+          JSON.stringify({ error: "当前星亿账号未绑定会员，无法投注" }),
+          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
       const token = session.login_token ?? "";
@@ -1885,13 +2320,13 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
 
       const betId = crypto.randomUUID();
       const totalCost = betAmount * picks.length;
-      const bet: BetRow = {
+      const bet: BetRow = withMemberId({
         id: betId, session_id: sessionId, lottery_id: lotteryId, issue, picks,
         bet_amount: betAmount, total_cost: totalCost, status: "pending",
         result_number: null, payout: 0, net: 0, position: betPosition,
         created_at: new Date().toISOString(), settled_at: null,
         remote_ids: [...new Set(remote_ids)],
-      };
+      }, session);
       if (!bets.has(sessionId)) bets.set(sessionId, []);
       bets.get(sessionId)!.push(bet);
       upsertBet(bet);
@@ -1905,9 +2340,11 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     }
 
     if (action === "betdays") {
+      const body = (await req.json().catch(() => ({}))) as { sessionId?: string };
+      const member = memberForSessionId(body.sessionId);
       return new Response(
         JSON.stringify({
-          days: dailySummary(),
+          days: member ? dailySummary(member.id) : [],
           rebatePerTurnover: 10000,
           rebateAmount: 475,
         }),
@@ -1916,15 +2353,24 @@ export async function handleLotteryProxy(req: Request): Promise<Response> {
     }
 
     if (action === "betdays-clear") {
-      const body = await req.json().catch(() => ({})) as { password?: string };
+      const body = await req.json().catch(() => ({})) as { password?: string; sessionId?: string };
       if (String(body.password ?? "") !== "138654") {
         return new Response(
           JSON.stringify({ error: "密码错误，无法清空" }),
           { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      bets.clear();
-      clearLedger();
+      const member = memberForSessionId(body.sessionId);
+      if (!member) {
+        return new Response(
+          JSON.stringify({ error: "找不到对应会员账本" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      for (const [sid, list] of bets) {
+        bets.set(sid, list.filter((item) => item.member_id !== member.id));
+      }
+      clearLedger(member.id);
       return new Response(
         JSON.stringify({ success: true, days: [] }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -1959,5 +2405,7 @@ setProxyCall(async (action, body) => {
   );
   const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
   return { status: resp.status, data };
-});
+}, (sessionId) => sessions.get(sessionId));
+
+ensureTelegramPoller();
 
